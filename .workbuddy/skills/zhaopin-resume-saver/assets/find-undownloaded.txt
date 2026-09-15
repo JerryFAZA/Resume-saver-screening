@@ -1,0 +1,18 @@
+// 查找第一个未下载的候选人并点击（用于去重下载）
+// NAME_SET: 已下载姓名的 Set，用 Unicode 格式
+// 返回: { clicked: "姓名" } 或 { allDone: true }
+
+(()=>{
+  const done = new Set([NAME_SET_PLACEHOLDER]);
+  const els = document.querySelectorAll('.talent-basic-info__name');
+  for (const el of els) {
+    const t = el.textContent.trim();
+    const sp = t.indexOf(' ');
+    const name = sp > 0 ? t.substring(0, sp) : t;
+    if (!done.has(name)) {
+      el.click();
+      return JSON.stringify({ clicked: name });
+    }
+  }
+  return JSON.stringify({ allDone: true });
+})()

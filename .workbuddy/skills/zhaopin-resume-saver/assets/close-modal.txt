@@ -1,0 +1,4 @@
+// 关闭简历详情模态（CDP 遮罩点击方式 - 推荐）
+// 用法：在模态打开时，用 CDP 点击左侧黑色遮罩区域关闭
+// 坐标：MaskCloseX, MaskCloseY（默认 30, 300）
+// 比 .click() 和 .new-shortcut-resume__close 更可靠

@@ -1,0 +1,23 @@
+// 收集页面上所有去重候选人姓名（处理虚拟滚动）
+// 将 window.__seenNames 作为累积 Set，多次滚动后调用获取完整列表
+
+// 初始化（首次调用）
+window.__seenNames = window.__seenNames || new Set();
+
+// 收集当前视口的姓名
+(()=>{
+  const els = document.querySelectorAll('.talent-basic-info__name');
+  els.forEach(el => {
+    const t = el.textContent.trim();
+    const sp = t.indexOf(' ');
+    const name = sp > 0 ? t.substring(0, sp) : t;
+    if (name) window.__seenNames.add(name);
+  });
+  return String(window.__seenNames.size);
+})();
+
+// 获取全部收集到的姓名列表
+(()=>{
+  const arr = Array.from(window.__seenNames || []);
+  return JSON.stringify(arr);
+})()

@@ -11,6 +11,3 @@ venv/
 # 输出目录（不保存）
 output/
 
-# IDE/工具本地数据
-.codebuddy/
-.workbuddy/
