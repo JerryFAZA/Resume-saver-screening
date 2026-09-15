@@ -108,48 +108,37 @@ SKILL_DIR = 本 SKILL.md 所在目录的绝对路径
 - 输出路径：C:\Resumes\AI初筛.xlsx
 ```
 
-## 工作流程
+## 工作流程（2026-09-15 #56 起机械部分由 pipeline.py 承载）
 
+固定机械流程已沉淀为 `scripts/pipeline.py`，Agent 只负责 AI 评估（唯一需要智能的环节）：
+
+```powershell
+# 阶段 1：准备评估表（复制模版 → 提取 → 填基础列 → 导出行顺序）
+<workspace>\.venv\Scripts\python.exe <SKILL_DIR>\scripts\pipeline.py prepare `
+    --resume-dir "<简历目录>" --output-xlsx "<输出.xlsx>"
+
+# 阶段 2：AI 评估完成后，写 evaluations.json 并校验（一条命令完成写入+读回校验）
+<workspace>\.venv\Scripts\python.exe <SKILL_DIR>\scripts\pipeline.py evaluate `
+    --xlsx "<输出.xlsx>" --evaluations "<evaluations.json>"
+
+# 单独校验（可选）
+<workspace>\.venv\Scripts\python.exe <SKILL_DIR>\scripts\pipeline.py verify --xlsx "<输出.xlsx>"
 ```
-用户提供 JD + 简历文件夹 + 输出 Excel 路径
-        │
-        ▼
-   校验三个参数是否齐全（缺失则提示用户）
-        │
-        ▼
-   步骤1: 检测文件格式，选择提取脚本
-        │  PDF → scripts/extract_resumes.py
-        │  DOCX → scripts/extract_docx.py
-        │  （两者输出格式一致，后续流程通用）
-        │
-        ▼
-   步骤2: 自验证 + 自动修复（仅 PDF 需此步骤，scripts/auto_fix.py）
-        │  DOCX 格式文本整洁，通常不需修复
-        │
-        ▼
-   步骤3: 按模版填入 Excel（scripts/fill_excel.py → fill_excel_template）
-        │  加载 EvaluationTemplate.xlsx，覆盖其数据行，写 12 列
-        │  （B/C 留空待 AI 评估；J 期望薪资自动从求职意向提取）
-        │  ⭐ 内置按「姓名+年龄」去重：重复投递简历只保留首份，不重复显示
-        │
-        ▼
-   步骤4: AI 评估（由 AI 阅读数据逐份评估）
-        │  根据 JD 判断匹配度（高/中/低）+ 标签评价
-        │  行业判断依据：公司名 + 工作描述内容，双重交叉验证
-        │  薪资判断：若 JD 含薪资区间，对比候选人期望薪资，标注薪资匹配/不匹配
-        │  ✅ 同名同年龄重复候选人已在步骤3去重（只保留首份），评估摘要不得出现重复投递条目
-        │  ⚠️ 注意英文版简历（字段大量为空），需人工阅卷
-        │
-        ▼
-   步骤5: 写入评估结果到 Excel（B/C 列）
-        │  首选「按行索引」写入（fill_excel.write_evaluation_row 或一次性脚本，
-        │  row = JSON索引 + 2），避开重名串行 bug
-        │  B 胜任力评级（高=C6EFCE / 中=FFFFB1 / 低=FFD9D9）、C 简要评价（标签+结论性建议）
-        │  写后必须读回校验 max_row / max_col / 样本行 / 各档位统计
-        │
-        ▼
-   输出最终 Excel + 结果摘要
-```
+
+### Agent 在管线中的职责边界
+
+| 环节 | 承担者 | 说明 |
+|------|--------|------|
+| 复制模版 / 提取 / 填表 / 去重 | pipeline.py `prepare` | 产物 `extracted_data.json` + `rows.json`（最终行顺序） |
+| **AI 评估** | Agent | 读 `rows.json` 逐份评估（rating: 高/中/低 + comment），写 `evaluations.json`：`[{"index": 0, "rating": "高", "comment": "..."}]`，index 以 rows.json 为准（**勿按姓名匹配，同名同龄会串行**） |
+| 写 B/C 列 + 色阶 + 读回校验 | pipeline.py `evaluate` | 内置 index/-rating 校验与非法条目跳过；verify 输出行数/档位分布/缺评行 |
+| PDF 简历（非 DOCX） | extract_resumes.py | pipeline.py 仅覆盖 DOCX 主流程；PDF 走 extract_resumes.py + auto_fix.py 后自行调 fill_excel_template |
+
+**流程要点（历史经验的代码化映射）**：
+- `fill_excel_template` 内置「姓名+年龄」去重（重复投递只保留首份）→ 评估摘要不得出现重复条目
+- `write_evaluation_row` 按行索引写入（row = index + 2）→ 避开按姓名匹配的串行 bug
+- `evaluate` 命令自动执行读回校验（verify：总行数/档位分布/缺评行/样本）
+- B/C 列色阶：高=C6EFCE / 中=FFEB9C / 低=FFC7CE（pipeline 内置）
 
 ## 输出 Excel 格式（⭐ 2026-09-15 起默认按 EvaluationTemplate.xlsx 模版）
 
@@ -265,6 +254,10 @@ cd <workspace>
 uv init --no-readme --name resume-screening
 uv add openpyxl pandas pypdf python-docx
 ```
+
+### scripts/pipeline.py — 管线入口（⭐ 首选，#56）
+
+一条命令跑完机械部分；用法见「工作流程」章节。子命令：`prepare`（复制模版+提取+填表+导出行顺序）/ `evaluate`（写评估+自动校验）/ `verify`（单独校验）。依赖同目录的 extract_docx.py 与 fill_excel.py。
 
 ### scripts/extract_resumes.py — PDF 提取模块
 

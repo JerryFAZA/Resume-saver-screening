@@ -1,4 +1,4 @@
----
+﻿---
 name: zhaopin-resume-saver
 description: |
   从智联招聘（rd6.zhaopin.com）推荐页面自动批量浏览并保存候选人简历（Word/DOCX）。
@@ -41,7 +41,10 @@ agent_created: true
 ### D. daemon 版本与扩展版本必须匹配
 - daemon v1.11.3 + 扩展 v2.0.9 握手成功（`hello from extension v2.0.9 (daemon v1.11.3)`）但请求异常。执行 `kimi-webbridge upgrade` 对齐后正常。
 
-### ⭐ E. 标准启动序列（一站式 checklist，Agent 必须按此顺序执行）
+### ⭐ E. 标准启动序列（已代码化为 `Initialize-WebBridgeEnv`，此节保留作排障知识）
+
+> **2026-09-15 #56 起，A-D 四项自检已内建于 run.ps1 的 [0] 阶段**（失败 exit 3），
+> Agent 无需再手工执行本序列；但在**计划任务 wrapper** 中仍需按此顺序写代码（wrapper 先于 run.ps1 运行）。
 
 以上 A-D 四个坑在 2026-09-15 实战中全部踩过、合计浪费约 40 分钟排查。**不要逐个踩完再修**，启动前一次性按下面顺序做完：
 
@@ -50,52 +53,40 @@ agent_created: true
 & "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" stop 2>$null
 & "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" upgrade
 
-# ② 常驻承载 daemon（防坑 B）：必须用 run_in_background 的任务承载，
+# ② 常驻承载 daemon（防坑 B）：必须用独立进程树（计划任务）承载，
 #    命令 = start + 长时间 Start-Sleep（如 7200 秒），保证父进程存活
 & "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" start 2>&1 | Out-String; Start-Sleep -Seconds 7200
 
 # ③ 就绪探测（防坑 A）：等扩展重连（约 10-30 秒），循环探测必须 --noproxy
+#    ★ 必须用 list_tabs 真探测——daemon 活着但扩展未连接时 snapshot 返回业务错误
+#      "no tab"，会把未就绪误判为就绪（#55 排障实测，扩展掉线后 round 6 才重连）
 $ok = $false
-for ($i=1; $i -le 12; $i++) {
+for ($i=1; $i -le 40; $i++) {
     Start-Sleep -Seconds 5
-    $probe = '{"action":"snapshot","args":{},"session":"probe"}'
+    $probe = '{"action":"list_tabs","args":{},"session":"probe"}'
     [System.IO.File]::WriteAllText("$env:TEMP\wb-probe.json", $probe, [System.Text.UTF8Encoding]::new($false))
     curl.exe -sS --noproxy "*" -X POST http://127.0.0.1:10086/command -H "Content-Type: application/json" --data-binary "@$env:TEMP\wb-probe.json" --output "$env:TEMP\wb-probe-res.json"
     if (Select-String -Path "$env:TEMP\wb-probe-res.json" -Pattern '"ok":true' -Quiet) { $ok = $true; break }
 }
-if (-not $ok) { throw "WebBridge daemon/extension not ready after 60s" }
+if (-not $ok) { throw "WebBridge extension not connected after 200s" }
 
-# ④ 启动下载（防坑 A/B）：run_in_background + 会话内设 NO_PROXY
+# ④ 启动下载（防坑 A/B）：计划任务内设 NO_PROXY 后运行 run.ps1
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $env:NO_PROXY = "127.0.0.1,localhost"; $env:no_PROXY = "127.0.0.1,localhost"
 & "$SKILL_DIR\scripts\run.ps1"
 ```
 
 - ③ 探测通过 = daemon + 扩展 + 版本 + 代理四项全部就绪，此后再启动下载脚本。
-- 探测用临时 session 名即可；snapshot 是最轻量的探测 action。
-- **运行中脚本热改无效**：修改 run.ps1 后必须 stop 任务 → 重启才生效（PS 启动时已把脚本解析进内存）。
+- **运行中脚本热改无效**：修改 run.ps1/lib 后必须 stop 任务 → 重启才生效（PS 启动时已把脚本解析进内存）。
 
-### ⭐ F. 中断续传（2026-09-15 新增，run.ps1 已内置 #52）
+### ⭐ F. 中断续传（run.ps1 已内置，#52/#53/#56）
 
-下载中断（手动停止/故障/名单过期）后重启会自动续传，无需手工干预：
+下载中断（手动停止/故障）后重启会自动续传，无需手工干预：
 
-- 脚本启动时扫描 `DownloadDir` 已有 `*.docx`，按文件名首段（姓名）预填跳过名单，日志输出 `[RESUME] N resume(s) already in target dir`。
+- 脚本启动时扫描 `DownloadDir` 已有简历，按 `姓名_年龄`（从文件名解析）预填 `$prefilled` 基础表，与主循环 `$processed` 完整表双表过滤，日志输出 `[RESUME] N resume(s) already in target dir`。
 - **Agent 唯一要做的事**：重启前把 `config.json` 的 `DownloadCount` 改为 `目标总数 - 目录已有份数`（如 100-87=13），否则会超额下载。
 - 同名不同人风险由 `Move-OneResume` 的 DUP 三重验证（姓名+年龄+文件大小）兜底；实测 45 份文件名无重名。
-- 下载中段出现连续 `[SKIP] Not found after full-list sweep` 后自动 `[STALE] ... breaking to TOP-UP` 重新收集名单——**这是预期自愈行为，不是故障**，不要手动干预；单次 SKIP 现在最多 ~15 秒（sweep 重试 25→10，#52）。
-
-## 快速运行（Agent 执行准则）
-
-1. 更新 `scripts/config.json` 填入参数（**优先使用 config.json 传参，避免命令行内嵌 URL 导致 `&tab=` 被 cmd 误解析**）
-2. **按「环境前置检查 E」的标准启动序列执行**（版本对齐 → 后台常驻承载 daemon → `--noproxy` 就绪探测 → 启动下载），不要裸 `start` 后直接跑脚本——A-D 四个坑都已在实战中踩过
-3. **⭐ 编码保护（CRITICAL）**：`run.ps1` 已内置 `[Console]::OutputEncoding = UTF8`，但为防止 Agent 环境中中文 stdout 被截断，**Agent 调用时强烈建议前置设置编码**：
-   ```powershell
-   [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-   & "$SKILL_DIR\scripts\run.ps1"
-   ```
-   > **不要嵌套 `powershell -File`**，直接用 PS 工具的 `&` 调用运算符执行 `.ps1`。嵌套会导致子进程继承错误的控制台编码。
-4. 如果必须在命令行传参，URL 中的 `&` 需要用 `^&` 转义（cmd）或用单引号包裹（PowerShell）
-5. **中断重启**：见「环境前置检查 F」——先把 `DownloadCount` 改为 `目标总数 - 已有份数`，脚本自动跳过已下载姓名（`[RESUME]` 日志确认）
+- 主循环中 `[SKIP]`（点击失败登记跳过）、`[TOP-UP]`（到底回顶重扫）、`RECOVER`（session 自愈）都是**预期自愈行为，不是故障**，不要手动干预。
 
 ## 参数
 
@@ -157,511 +148,91 @@ SKILL_DIR = 本 SKILL.md 所在目录的绝对路径
 3. 守护进程运行中（`~/.kimi-webbridge/bin/kimi-webbridge start`）
 4. **所有 `.ps1` 脚本文件必须使用 UTF-8 BOM 编码**（中文 Windows 强制要求）
 
-## 脚本架构
 
-```
-scripts/
-├── config.json            # JSON 配置文件（run.ps1 实际读取此文件，Agent 执行前需填入参数）
-├── config.ps1             # [已弃用] 旧版 PS 配置文件，不再被 run.ps1 使用
-├── fix_config.py          # [已弃用] 修复 config.ps1 编码的辅助脚本（无硬编码路径，仅作备用）
-├── webbridge-utils.ps1    # [已弃用] WebBridge 通信工具模块，函数已内建于 run.ps1
-├── download-loop.ps1      # [已弃用] 下载循环逻辑，函数已内建于 run.ps1
-└── run.ps1                # 主入口脚本（唯一入口，自包含所有逻辑）
+## 脚本架构（2026-09-15 模块化重构，#56）
 
-assets/
-├── close-modal.txt        # 关闭模态说明
-├── find-undownloaded.txt  # 查找未下载候选人 JS 模板
-└── collect-names.txt      # 收集候选人姓名 JS 模板
+**固定流程已全部沉淀为脚本；本文档只保留经验。改流程 = 改脚本，不是改文档。**
 
-references/
-└── tech_details.md        # 页面技术细节、踩坑记录、编码规范
-```
+| 文件 | 职责 |
+|---|---|
+| `scripts/run.ps1` | 主编排（薄层）：配置校验 → 环境自检 → 导航/岗位选择/验证 → 下载主循环 → 汇总。所有流程步骤在此串联 |
+| `scripts/lib/wb-core.ps1` | 通用层：WebBridge 客户端（Send-Web/Invoke-Eval/Invoke-Click/Invoke-CDP）、Write-Log 结构化日志（UTF-8 无 BOM 落盘）、Invoke-WithRetry / Wait-Until 稳定性原语、Initialize-WebBridgeEnv 环境自检、Stop-BrowserAutomation（幂等）、标签页管理（Switch-ToDetailTab/Clear-StaleDetailTabs）、ConvertTo-JsSafeName |
+| `scripts/lib/zhaopin-page.ps1` | 智联页面层：Select-JobTab 双路径选岗（#28）、Get-ActiveJobName 验证（#38）、卡片提取 + 三重校验标记（#53/#54）、Close-ModalIfOpen、存至本地/word/保存序列（#44/#45/#46/#55）、Get-ZhaopinFiles 结构化文件识别 + Move-OneResume 移动去重 |
+| `scripts/config.json` | 运行参数（数据，非逻辑） |
+| `assets/*.txt` | 可复用 JS 模板（参考用，与 lib 内实现同源） |
+| `references/tech_details.md` | 页面结构、选择器、CDP 坐标、完整踩坑记录 |
 
-### 配置项说明（`config.json`）
+### 稳定性机制（内建于脚本，#56）
 
-`run.ps1` 实际读取 `config.json`（UTF-8 无 BOM），支持通过命令行参数覆盖：
+1. **环境自检** `Initialize-WebBridgeEnv`：设 NO_PROXY → daemon 端口检查/启动 → **`list_tabs` 真探测**（snapshot 在"daemon 活着但扩展未连接"时返回业务错误 "no tab"，会糊弄探测——必须用 list_tabs）等扩展重连（最多 200s）
+2. **结构化日志** `Write-Log`：时间戳分级（INFO/OK/WARN/FAIL/STEP）写 `<DownloadDir>\_run_log.txt`（UTF-8 无 BOM）——替代 `*>` 重定向产生 UTF-16 文件的历史痛点
+3. **deadline 制等待** `Wait-Until`：所有关键等待从"固定次数×固定间隔"改为超时制，单个等待永不过期也永不失控
+4. **单轮异常保护**：主循环 try/catch——单轮未预期异常记日志+关面板+继续，连续 5 轮才终止（防异常风暴杀死整任务）
+5. **断点续传**：启动扫描 DownloadDir，`$prefilled`（姓名_年龄）+ `$processed`（完整 key）双表过滤
+6. **移动重试**：Move-OneResume 对被占用文件重试 3 次（每 500ms）
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `Url` | string | 是 | 智联推荐页完整 URL（含 `jobNumber`，不含 `#` 片段） |
-| `JobName` | string | 是 | 岗位名称，需与页面标签匹配（支持包含匹配） |
-| `DownloadDir` | string | 是 | 简历保存目录（绝对路径） |
-| `DownloadCount` | number | 否 | 下载数量，默认 5 |
-| `FileFormat` | string | 否 | `"word"`（默认，`.docx`）或 `"pdf"` |
+### 产物与退出码
 
-> **Agent 执行准则**：每次执行前必须将用户指定的参数写入 `config.json`（`Url`、`JobName`、`DownloadDir`、`DownloadCount`、`FileFormat`），不依赖 `config.json` 中的旧值。命令行参数同样支持，但更新 `config.json` 更可靠（避免 CLI 传输中文乱码）。
+- `<DownloadDir>\_summary.json`：机器可读结果 `{status: DONE|INCOMPLETE, ok, fail, skip, target, fileCount, format, finishedAt}` —— **Agent 判断是否补跑只看这个文件，不要解析日志**
+- `<DownloadDir>\_run_log.txt`：结构化日志
+- 退出码：**0**=达标完成 / **2**=未达标（候选池耗尽）/ **1**=参数或岗位致命 / **3**=环境致命
 
-### 旧版配置项说明（`config.ps1` — 已弃用，仅供参考）
-    SaveLocalY   = 142    # "存至本地"按钮 Y
-    SaveConfirmX = 996    # "保存"确认按钮 X
-    SaveConfirmY = 561    # "保存"确认按钮 Y
-    MaskCloseX   = 30     # 遮罩关闭区域 X
-    MaskCloseY   = 300    # 遮罩关闭区域 Y
+## 快速运行（Agent 执行准则）
 
-    CloseWaitMs        = 700
-    ClickWaitMs        = 800
-    MouseMoveWaitMs    = 900
-    PressReleaseWaitMs = 400
-    DialogCheckWaitMs  = 2000
-    DownloadWaitMs     = 6000
-    ScrollWaitMs       = 1200
+1. 更新 `scripts/config.json`（**优先 config.json 传参，避免命令行 URL 的 `&tab=` 被 cmd 误解析**）
+2. 环境自检已内建于 run.ps1（[0] 阶段，失败 exit 3）。**但 15 分钟级批量任务必须用计划任务承载**（见下节），Agent 会话内后台任务约 2 分钟被宿主强杀
+3. 调用时前置 `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`；**不要嵌套 `powershell -File`**，用 PS 的 `&` 调用运算符
+4. 中断重启：`DownloadCount` 改为 `目标总数 - 目录已有份数`（断点续传自动跳过，`[RESUME]` 日志确认）
+5. 结束后读 `_summary.json` 判断结果；日志中 `[TOP-UP]`/`[SKIP]`/`RECOVER` 是**预期自愈行为**，不要手动干预
 
-    DownloadFilter = "*智联*"
-    DownloadSource = "$env:USERPROFILE\Downloads"
-}
-```
+### ⭐ 长任务调度经验（CRITICAL，2026-09-15 实测）
 
-### 快速运行
-
-> **注意**：首次使用前，必须填写 `config.ps1` 中的 `Url`、`JobName`、`DownloadDir`，或通过命令行参数传入。参数缺失时脚本会打印帮助信息并退出。
-> **AI Agent 执行时**：`run.ps1` 路径必须使用 `$SKILL_DIR/scripts/run.ps1`（绝对路径）。
-
-方式一：编辑 `config.ps1` 填写参数后直接运行：
+- **会话内后台任务（含非沙箱 run_in_background）约 2 分钟被宿主强杀**，daemon 作为子进程连带死亡 → 批量下载在会话内根本跑不完。这就是"必须计划任务"的根因
+- **唯一可靠方式：`Register-ScheduledTask` 计划任务**（独立进程树，宿主杀不到）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "$SKILL_DIR\scripts\run.ps1"
+$act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File <wrapper.ps1>"
+Register-ScheduledTask -TaskName "WbResumeDL" -Action $act -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2)) -Force
+Start-ScheduledTask -TaskName "WbResumeDL"
 ```
 
-方式二：通过命令行参数覆盖（推荐，无需修改配置文件）：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File "$SKILL_DIR\scripts\run.ps1" `
-    -Url "https://rd6.zhaopin.com/app/recommend?jobNumber=XXX&tab=recommend" `
-    -JobName "销售部经理" `
-    -DownloadDir "C:\Resumes\销售部经理" `
-    -DownloadCount 30 `
-    -FileFormat "word"   # 或 "pdf"
-```
-
-### 文件格式参数（`FileFormat`）
-
-| 值 | 后缀 | 弹窗行为 | 等待时间 |
-|----|------|---------|---------|
-| `word`（默认） | `.docx` | 先点击"word"图标，再点"保存" | release 后 1000ms 关面板（#55），落盘轮询检测窗口 25s |
-| `pdf` | `.pdf` | 直接点击"保存"按钮 | release 后 1000ms 关面板（#55），落盘轮询检测窗口 15s |
-
-> **Word 模式（默认）**：智联"保存到本地"对话框包含两个文件格式选项 `pdf` 和 `word`，PDF 默认选中。脚本会自动用 `getBoundingClientRect()` 探测 "word" 图标坐标，CDP 真实鼠标点击切换；之后弹窗下方提示变为"支持 word 2010 及以上版本"，作为切换成功的验证信号。如果使用 `pdf` 格式则跳过此步骤直接保存。
-
-## 工作流
-
-### 阶段 1：导航与岗位选择
-
-1. **确保守护进程运行**：Windows 使用 PowerShell 执行 `& "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" start`（安全幂等）
-2. **导航到推荐页**：调用 `navigate`，session 统一使用 `"resume-screening"`。URL 中建议去掉 `#` 片段。使用 `newTab=true` 创建新标签页
-3. **⭐ 标签页聚焦（关键修复）**：`navigate` 创建新标签页后，WebBridge 层面已将其设为 current tab 且 CDP 已连接，但浏览器 UI 未自动切换（`list_tabs` 显示 `active: false`）。**必须在 `navigate` 后调用 CDP `Page.bringToFront`**：
-   - `Page.bringToFront` 将当前 CDP 连接的标签页（即刚创建的新标签页）带到浏览器最前面
-   - ⚠️ **不要用 `find_tab`**：URL 模糊匹配会错误切回 session 中的旧标签页
-   - ⚠️ **不要用 `Target.activateTarget`**：被 Chrome 安全策略阻止（`Not allowed`）
-   - 聚焦成功后等待 3s 让页面渲染就绪
-4. **点击岗位标签**：在 snapshot 中搜索 `"link"` 角色且 `name` 等于 `jobName` 的 ref，使用 `click` 工具点击。页面 Vue 渲染需要时间，脚本会重试获取 snapshot（最多 8 次 × 1s）
-5. **等待列表加载**：主动轮询 `.talent-basic-info__name` 元素数量，直到 > 0
-6. **⭐ 岗位验证（关键安全步骤）**：点击岗位标签后，脚本会通过 JS 检测当前激活/高亮的岗位 Tab 名称，与 `jobName` 参数进行比对：
-   - 匹配成功 → 继续下载流程
-   - 匹配失败 → **立即停止并输出明确错误提示**，防止用错误岗位的候选人列表进行下载
-   - 无法检测 → 输出警告但继续（兼容极端情况）
-
-> 如 `click` 返回文本含"协作未上线"，忽略该提示，页面已正常切换。
-
-### 阶段 2：获取候选人列表（⭐ 2026-09-15 简化）
-
-> **⭐ 优化 #53**：下载主循环已改为「卡片登记 + 顺序推进」（见阶段 3），**不再依赖预收集的全量姓名名单**。本阶段仅做一次视口内姓名收集作为健康检查（列表非空即可，最多重试 3 次），**不再全列表滚动预收集**——省去下载前最长 80 屏 × 等待的无效滚动；候选池耗尽检测由下载循环的「到底探测 + 回顶重扫 + 空轮计数」承担。滚动一屏等待时间已由 1200ms 调整为 **800ms**（用户指定）。
-
-> **关键**：智联使用**虚拟滚动**，DOM 中始终仅保留约 20 个节点。
-
-**姓名提取方法**：使用正则 `/^\S+/` 匹配 `textContent.trim()` 后的第一个非空白序列：
-
-```javascript
-// 初始化
-window._SN = new Set();
-
-// 每次滚动后收集（正则提取纯姓名，避免换行干扰）
-(() => {
-  const els = document.querySelectorAll('.talent-basic-info__name');
-  els.forEach(el => {
-    const m = el.textContent.trim().match(/^\S+/);
-    if (m) window._SN.add(m[0]);
-  });
-})();
-```
-
-#### ⭐⭐ 滚动方式与停滞阈值（2026-09-15 关键修复）
-
-**必须用 JS 直接滚列表容器，不要用 CDP `mouseWheel` + 固定坐标**：
-
-```javascript
-// ✅ 正确：直接滚容器，可靠
-(() => {
-  const c = document.querySelector('.app-layout--default') || document.scrollingElement;
-  if (c) c.scrollTop = c.scrollTop + 900;
-  else window.scrollBy(0, 900);
-  return 'ok';
-})()
-```
-
-- ❌ 原实现用 CDP `mouseWheel` 在固定坐标 (500,600) 滚动，对虚拟滚动列表**不可靠**，会漏掉大量候选人。
-- **停滞阈值必须 ≥ 12 轮**（原为 3 轮，太激进）。虚拟滚动偶发不增量会被误判"已到底"：
-  - 实测：3 轮阈值在第 11 次滚动就误判到底，报"只有 31 位唯一候选人"；**实际列表有 142 个唯一姓名**。
-- 同时设置 `$maxScrolls = 80` 硬上限防死循环。
-- 收集完成后校验：若收集数远小于预期（如目标 100 却只收集到 30+），**不要下"推荐池就这么少"的结论**，先怀疑滚动缺陷。
-
-#### ⭐⭐ 进入下载阶段前必须重置滚动条到顶部（2026-09-15 关键修复）
-
-收集姓名时会把列表滚到底部。**下载阶段的查找逻辑从当前位置往下找，已在底部就永远找不到候选人**，表现为日志刷屏 `[SKIP] Not found in viewport`、长时间空转但一份都没点进去。
-
-```javascript
-// 收集完姓名、进入 [4] 下载阶段前，必须执行：
-(() => {
-  const c = document.querySelector('.app-layout--default') || document.scrollingElement;
-  if (c) c.scrollTop = 0;
-  window.scrollTo(0, 0);
-  return 'ok';
-})()
-// 然后 Wait 2500 让列表重新渲染
-```
-
-在循环中反复滚动 + 收集，直到 `Set.size` 不再增长（连续 12 轮无增量）或达到目标数量。
-
-### 阶段 3：逐条保存循环（⭐⭐ 2026-09-15 重构：卡片登记 + 顺序推进，不回顶）
-
-#### ⭐⭐ 优化 #53：新主循环流程（用户指定，替代旧"姓名名单 + 顶部 sweep"模式）
-
-**旧模式问题**：维护姓名名单 + 每个候选人都从列表顶部全列表 sweep 查找（#34/#36 引入），名单过期时每人最多浪费 10 次 × 900ms 滚动空转（#51/#52）。
-
-**新流程**（每轮循环）：
-
-1. **[A] 视觉识别卡片**：用 JS 提取当前视口内所有卡片的关键信息（**姓名 + 年龄 + 工作经历摘要**：年龄从卡片容器文本 `(\d{1,2})岁` 正则提取；工作经历摘要 = 容器文本剔除姓名/年龄/"N岁"及易变活跃时间词（刚刚/N秒钟前/N分钟前/N小时前/N天前/昨天/本周/本月/在线/活跃/看过）后取**前 30 字符**），返回 JSON 数组。
-2. **[B] 查登记表**：key = `姓名_年龄_工作经历摘要`，从 `$processed` 登记表中找出**第一条未登记**的卡片；同时比对 `$prefilled`（断点续传基础表，key = `姓名_年龄`）。
-3. **[C] 直接点击**：前台化（`Page.bringToFront`）→ JS 打标记（**三重校验**：姓名 `\uXXXX` 转义 + 年龄 + 工作经历摘要——匹配 JS 用与提取端完全相同的归一化链处理容器文本后 `indexOf` 校验摘要）→ WebBridge DOM `click`。**不再从顶部 sweep**——卡片就在视口内。点击成功后**立即登记** `$processed[key] = $true`（成功/失败/重复统一登记，防止反复点击同一卡片）。
-4. **处理段（3.2.5~3.9 沿用）**：确认面板 → 等按钮 → 存至本地（CDP）→ word → 保存 → 移动文件 → 关闭模态。**关闭后不回滚列表顶部**，直接进入下一轮 [A]。
-5. **[D] 视口无未处理卡片时**：从当前位置**继续向下滚一屏**（`scrollTop += 900`，等待 `ScrollWaitMs=800ms`），并做到底探测（`scrollTop+clientHeight >= scrollHeight-50`）。
-6. **池耗尽判定**：到底且**连续 3 轮**滚动无新卡片 → 空轮计数；**连续 3 轮空轮**（回顶重扫均无新卡片）才停止。回顶重扫时推荐列表会动态重排，重排产生的新卡片不在登记表中，会被 [B] 发现并下载（保留 #33"未达标绝不停止"精神）。
-
-**配套变更**：
-
-- **断点续传升级**：启动时扫描目标目录已有简历，按 `姓名_年龄` 预填 `$prefilled` 基础登记表（文件名不含工作经历，无法预填完整 key）；[B] 查找时 `$processed`（完整 key）与 `$prefilled`（基础 key）双表过滤，命中任一即跳过。
-- **`$triedCandidates` 已删除**，统一由 `$processed` 登记表承担；原「外层轮次 + 内层遍历 + 补收名单」双循环结构移除。
-- **已知限制（#54 升级后）**：卡片 key = 姓名+年龄+工作经历摘要（前 30 字符），**三要素全部相同才视为同一卡片**——同名同龄但工作经历不同的候选人可被正确区分并分别下载；仅剩同名+同龄+摘要前 30 字符恰好一致的极端情况视为同一卡片（受 DUP 三重验证兜底）。
-
-#### 旧版循环结构（已被 #53 取代，仅供排查历史日志参考）
-
-#### ⭐⭐ 循环结构：未达标绝不停止（2026-09-15 关键修复）
-
-**问题**：原实现是单层循环 `while ($ok -lt $downloadCount -and $idx -lt $names.Count)`。一旦 `$names` 被遍历完（例如收集阶段只拿到 31 个名字，但目标 100 份），循环**立刻退出**，日志显示"Success: 31"就结束了 —— **远未达到要求的目标份数，但脚本已经停了**。
-
-**修复：改为「外层轮次 + 内层遍历 + 补收名字」双循环结构**：
-
-```
-while ($ok -lt $targetCount) {                    # 外层：只要没达标就一直转
-    ┌─ 内层：遍历当前 $names 名单，逐条下载
-    │    while ($ok -lt $targetCount -and $idx -lt $names.Count) { ... }
-    │
-    ├─ 本轮遍历完仍未达标 → 判定空轮计数
-    │    $ok 有增长 → $emptyRounds = 0（重置）
-    │    $ok 无增长 → $emptyRounds++
-    │    连续 3 轮无产出 → 认定候选池真的耗尽，break
-    │
-    └─ 补收名字（TOP-UP）：
-         ① 滚动回顶部，重置 window._SN
-         ② 重新扫列表，停滞阈值放宽到 20 轮、maxScrolls 翻倍（比首轮更耐心）
-         ③ 新名字**追加**到 $names（去重保留原顺序）
-         ④ $idx = 0 重新遍历（已试过的候选人在 $triedCandidates 里被跳过）
-         ⑤ 列表滚回顶部，进入下一轮
-}
-```
-
-**关键点**：
-- 只有两种情况允许停止：`$ok >= $targetCount`（达标），或**连续 3 轮完全没有任何新下载**（候选池确实耗尽）。
-- 补收阶段的停滞阈值（20 轮）比首轮（12 轮）更宽松 —— 首轮可能被虚拟滚动偶发不增量误判，后续轮次应更耐心。
-- `$triedCandidates` 哈希表跨轮次持续生效，避免对同一候选人反复重试。
-- 汇总区明确区分 `[DONE] Target reached` 与 `[INCOMPLETE] pool exhausted`，便于 Agent 判断是否要补跑。
-
-#### ⭐⭐ 查找候选人：相对顶部定位 + DOM click（2026-09-15 关键修复）
-
-**问题 1（滚动累加卡死）**：原实现只在 `$retry -eq 0` 时归零到顶部，后续轮次在**当前 scrollTop 上继续叠加** `+700`。一旦滚到列表底部，后面所有重试都停在底部原地打转 —— 日志刷屏 `[SKIP] Not found in viewport`，一份详情都点不进去。
-
-**修复 1：改用「相对顶部定位」**，每次重试都从 0 重新滚到目标偏移：
-
-```powershell
-for ($retry = 0; $retry -lt 25; $retry++) {
-    $offset = $retry * 700          # ★ 相对顶部的绝对偏移
-    $null = Invoke-Eval ('(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=' + $offset + ';else window.scrollTo(0,' + $offset + ');return "ok"})()')
-    Wait 900
-    ... 在视口内查找候选人 ...
-}
-```
-
-- ❌ 错误写法：`c.scrollTop = c.scrollTop + 700`（累加，到底后卡死）
-- ✅ 正确写法：`c.scrollTop = $offset`（绝对定位，每次都从顶部重新走）
-
-**问题 2（⭐ 真正的根因，问题 #44）**：即使列表滚动正确、候选人姓名已在视口内，**用 JS `el.click()` 依然打不开详情面板**。原因是**同窗口多标签页时，非前台标签页的 render widget 被隐藏，Chrome 不再向其投递输入事件** —— 所有 `mouse_click` / CDP `Input.dispatchMouseEvent` **静默失败**（返回 `ok:true` 但页面毫无反应）。
-
-daemon 报错原文：
-```
-the click did not reach the page — no pointerdown/mousedown fired.
-The tab is likely backgrounded and occluded...
-```
-
-**修复 2：候选人姓名用「前台化 + DOM click」，面板内按钮用「前台化 + CDP 真实鼠标事件」**。
-
-```powershell
-function Ensure-TabFocused {
-    $null = Send-Web -Action 'cdp' -Payload @{ method = 'Page.bringToFront'; params = @{} }
-}
-function Invoke-Click {
-    param([string]$Selector)
-    $r = Send-Web -Action 'click' -Payload @{ selector = $Selector }
-    return ($r -match '"success":true')
-}
-```
-
-**查找候选人 = JS 打标记 + DOM click**（三步，缺一不可）：
-
-```powershell
-Ensure-TabFocused                                    # ① 先把任务标签页拉到前台
-$fjs = '(()=>{const e=document.querySelectorAll(''.talent-basic-info__name'');for(const el of e){if(el.textContent.trim().indexOf("' + $safeName + '")>=0){el.setAttribute("data-wb-target","1");return"ok"}}return"no"})()'
-$fr = Invoke-Eval $fjs
-if ($fr -match '"value":"ok"') {                     # ② JS 只打标记，不点击
-    Ensure-TabFocused
-    if (Invoke-Click '[data-wb-target="1"]') { $found = $true; ...; break }   # ③ 用 WebBridge DOM click
-}
-```
-
-> **为什么用 `setAttribute` 打标记而不是直接 `el.click()`？**
-> WebBridge 的 `click` action 是**选择器驱动**的 DOM 级点击，它能正确触发 Vue 的合成事件；而手写 `el.click()` 在虚拟滚动 + Vue 组件场景下不可靠。标记法把"JS 查找"和"真实点击"解耦，两者各司其职。
->
-> ⚠️ **注意分工**：候选人姓名用 DOM `click` 有效，但**详情面板内的按钮（存至本地 / word / 保存）不响应 DOM click**，必须用 CDP 真实鼠标事件 —— 详见 3.4 / 3.6。
-
-**Session 无标签页时自愈**：若查找返回 `"ok":false`（session 中已无 tab），立即重新 `navigate` 回列表页再继续，**不要静默空转**：
-
-```powershell
-if ($fr -match '"ok":false') {
-    Write-Host '  [RECOVER] No tab in session, re-navigating to list...' -ForegroundColor Yellow
-    $null = Send-Web -Action 'navigate' -Payload @{ url = $Config.JobUrl }
-    Wait 4000
-    continue
-}
-```
-
-对每条候选人重复以下步骤：
-
-#### 3.1 关闭模态（遮罩点击方式 — 最可靠）
-
-```
-cdp: mousePressed  → (MaskCloseX, MaskCloseY) = (30, 300)
-等待 200ms
-cdp: mouseReleased → (MaskCloseX, MaskCloseY)
-等待 700ms
-```
-
-> **遮罩点击是当前最可靠的关闭方式**。`.job-pane__item--close` 和 `.new-shortcut-resume__close` 的 JS `.click()` 在虚拟滚动场景下不可靠。
-
-#### 3.2 查找并点击候选人
-
-**必须遵循「前台化 → JS 打标记 → DOM click」三步**（详见上方「查找候选人」章节）：
-
-```powershell
-Ensure-TabFocused
-# ① JS 只负责查找 + 打 data-wb-target 标记，不执行点击
-#    ⚠️ JS 字符串外层用单引号，内层字符串用双引号（见"双引号陷阱"）
-$fjs = '(()=>{const e=document.querySelectorAll(''.talent-basic-info__name'');for(const el of e){if(el.textContent.trim().indexOf("' + $safeName + '")>=0){el.setAttribute("data-wb-target","1");return"ok"}}return"no"})()'
-$fr = Invoke-Eval $fjs
-if ($fr -match '"value":"ok"') {
-    Ensure-TabFocused
-    Invoke-Click '[data-wb-target="1"]'      # ② 选择器驱动的 DOM click，触发 Vue 合成事件
-}
-```
-
-> ❌ **不要用 `el.click()`** —— 历史写法，在虚拟滚动 + Vue 组件场景下不可靠，常表现为"返回 ok 但面板没打开"。
-> ✅ 用 `setAttribute` 打标记 + WebBridge `click` action，由 daemon 派发真实 DOM 点击。
->
-> **⭐ 每次点击前都要 `Ensure-TabFocused`**：标签页被遮挡时 Chrome 不投递任何输入事件，所有点击静默失效（问题 #44）。这是"卡死空转"的根本原因之一。
-
-#### 3.2.5 确认详情面板已打开
-
-点击后必须**验证 `.resume-detail-wrap` 确实出现**，否则视为失败并重开：
-
-```powershell
-Wait 2500
-$pr = Invoke-Eval '(()=>{return document.querySelector(".resume-detail-wrap")?"yes":"no"})()'
-if ($pr -notmatch '"value":"yes"') {
-    # 兜底：重新点击一次姓名
-    Ensure-TabFocused
-    $null = Invoke-Click '.talent-basic-info__name'
-    Wait 2500
-}
-```
-
-> 不确认就直接往下等按钮，会在面板根本没打开的情况下白等 30 秒 —— 这正是"空转"的典型表现。
-
-#### 3.3 等待"存至本地"按钮出现（两段式等待）
-
-```
-第一段：等 .resume-detail-wrap 渲染 —— 最多 20 次 × 500ms = 10s
-第二段：等 .resume-button.position-r 可见（width>0 && height>0）
-        最多 40 轮 × 750ms = 30s   ← ★ 实测需要 10~15 秒
-```
-
-> ⚠️ **等待不充分是常见失败原因（问题 #45）**。实测该按钮**延迟 10~15 秒**才出现，原 15 次 × 500ms（7.5s）上限远远不够 —— 脚本在按钮出现前就放弃，探不到坐标即判定失败。
->
-> ⭐ **该按钮会反复闪烁**（Vue 反复挂载/卸载）：一旦探测到可见坐标，**必须在同一轮立即点击，不要额外加延时** —— 加延时会等到它消失。
-
-#### 3.4 触发"存至本地"（CDP 真实鼠标事件 + 12 次重试）
-
-**此按钮不响应 DOM click / `dispatchEvent`，必须 CDP 真实鼠标事件**（问题 #46，本修复是最终跑通的关键）：
-
-```powershell
-$hasDialog = $false
-for ($saveRetry = 0; $saveRetry -lt 12; $saveRetry++) {
-    Ensure-TabFocused
-    # ① 探测坐标（探测与点击必须紧邻，按钮会闪烁）
-    $rslr = Invoke-Eval '(()=>{const b=document.querySelector(".resume-button.position-r");if(!b)return"x";const r=b.getBoundingClientRect();if(r.width<=0||r.height<=0)return"x";return Math.round(r.x+r.width/2)+","+Math.round(r.y+r.height/2)})()'
-    $rslc = Parse-Coords $rslr
-    if ($rslc) {
-        $saveLocalX = $rslc[0]; $saveLocalY = $rslc[1]
-        Invoke-CDP -Type 'mouseMoved'    -X $saveLocalX -Y $saveLocalY
-        Invoke-CDP -Type 'mousePressed'  -X $saveLocalX -Y $saveLocalY -Button 'left'
-        Wait 80
-        Invoke-CDP -Type 'mouseReleased' -X $saveLocalX -Y $saveLocalY -Button 'left'
-    } else {
-        # ② 探不到 → 面板可能已被关闭，重开
-        $panelStill = Invoke-Eval '...document.querySelector(".resume-detail-wrap")?"yes":"no"...'
-        if ($panelStill -notmatch '"value":"yes"') { Ensure-TabFocused; $null = Invoke-Click '.talent-basic-info__name'; Wait 2500 }
-        else { Wait 400 }
-    }
-    Wait $Config.DialogCheckWaitMs
-    # ③ 检查"保存"对话框是否出现
-    $cr = Invoke-Eval '...x.textContent.trim()==="\u4fdd\u5b58"...'
-    if ($cr -match '"value":"has"') { $hasDialog = $true; break }
-}
-```
-
-**关键点**：
-- 重试上限 **12 次**（原 4 次不够）—— 按钮闪烁期间需要多轮机会"撞上"可见窗口。
-- 探测到坐标后**立即** Moved→Pressed→Released，press/release 间隔仅 80ms。
-- 探不到坐标时先判断面板是否还开着，**关了就重开**，不要傻等。
-- 每一步之前都 `Ensure-TabFocused` —— 遮挡状态下 CDP 事件全部静默丢失。
-
-#### 3.5 选择 word 格式
-
-先 JS 打临时标记，再用 DOM click；失败退回 CDP 坐标点击：
-
-```powershell
-Ensure-TabFocused
-$null = Invoke-Eval '(()=>{const bs=document.querySelectorAll("button,li,div,span");for(const b of bs){if(b.textContent.trim()==="word"){b.setAttribute("data-wb-word","1");return"ok"}}return"no"})()'
-if (-not (Invoke-Click '[data-wb-word="1"]')) {
-    # 兜底：CDP 坐标点击（实测坐标约 876,384）
-    Invoke-CDP -Type 'mousePressed'  -X $Config.WordOptionX -Y $Config.WordOptionY -Button 'left'
-    Wait 80
-    Invoke-CDP -Type 'mouseReleased' -X $Config.WordOptionX -Y $Config.WordOptionY -Button 'left'
-}
-```
-
-#### 3.6 保存文件（★ #55：release 后 1000ms 即关面板）
-
-```
-先打 data-wb-save 标记 → DOM click → 失败退回 CDP 坐标点击（记录 $clickTime 基准）
-cdp: mouseMoved   → (sx, sy)  等待 200ms
-cdp: mousePressed → (sx, sy)  等待 80ms
-cdp: mouseReleased→ (sx, sy)  等待 1000ms（用户指定，不再阻塞等 DownloadWaitMs）
-→ 立即关闭详情面板（Close-ModalIfOpen + .km-modal__close-btn DOM click 兜底）
-→ 轮询检测新文件落盘（word 25s / pdf 15s 窗口，每秒查一次 Downloads，
-   文件 LastWriteTime > clickTime-5s 判定命中）
-```
-
-> ⚠️ 面板关闭后**无法重开重点保存**，原 3 次重试循环已随 #55 移除；下载已由浏览器接管，面板关闭不影响继续写盘。
-> ⚠️ 面板内的所有按钮（存至本地 / word / 保存）**都不能用 JS `.click()`**。DOM click 对部分按钮有效，但**存至本地按钮必须用 CDP 真实鼠标事件**。统一策略：先试 DOM click，失败即退回 CDP 坐标点击。
-
-#### 3.7 移动文件 + 去重检查
-
-```
-检查 Downloads 下最新 *智联* 文件 → 去重判断 → Move-Item 到 downloadDir
-```
-
-#### 3.8 关闭详情面板
-
-```powershell
-$null = Close-ModalIfOpen      # 遮罩点击方式，见 3.1
-# 若存在 .km-modal__close-btn，再用 DOM click 补一刀
-if ((Invoke-Eval '...document.querySelector(".km-modal__close-btn")?"yes":"no"...') -match '"value":"yes"') {
-    Ensure-TabFocused
-    $null = Invoke-Click '.km-modal__close-btn'
-}
-```
-
-> 早期版本曾在此处引入 `Switch-ToDetailTab` / `Clear-StaleDetailTabs` 切标签页逻辑，**后经排查确认是误判**（详情面板是页内 `.resume-detail-wrap`，不是新标签页）。该逻辑已废弃，但 `Clear-StaleDetailTabs` 中的一条铁律必须保留：
->
-> ⚠️ **绝不能关闭 `active=true` 的标签页**（问题 #43）。一旦关掉，`list_tabs` 返回 `tabs: []`，session 无可用 tab，后续所有操作返回 `ok:false`，日志连续刷 `[SKIP]`。若确实要清理，只关 `active=false` 的详情残留页。
-
-### 阶段 4：完成与收尾
-
-#### ⭐⭐ 任务结束后必须停止浏览器自动化（2026-09-15 新增）
-
-当 `$ok` 达到 `downloadCount`（或候选池耗尽）后，**必须显式停止浏览器自动化**，否则会残留：
-
-- 为任务创建的新标签页（可能继续触发页面行为，用户看着像"还在自动跑"）
-- CDP 自动化连接（占用浏览器控制权，用户手动操作会被干扰）
-- WebBridge daemon 常驻进程（后台长期存活）
-
-**收尾函数 `Stop-BrowserAutomation`**（已内置于 `run.ps1`，在汇总前调用）：
-
-```powershell
-function Stop-BrowserAutomation {
-    param([switch]$Quiet)
-    if ($Script:AutomationStopped) { return }   # 幂等：重复调用直接返回
-    $Script:AutomationStopped = $true
-
-    # 1) 关闭本次任务创建的标签页
-    try { $null = Send-Web -Action 'close_tab' -Payload @{} } catch {}
-    Wait 800
-
-    # 2) 断开 CDP 自动化连接，释放浏览器控制权
-    try { $null = Send-Web -Action 'cdp_disable' -Payload @{} } catch {}
-
-    # 3) 停止 daemon（真正终止自动化常驻进程）
-    try { $null = & "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" stop 2>&1 } catch {}
-
-    # 4) 清理请求临时文件
-    Remove-Item $ReqFilePath -Force -ErrorAction SilentlyContinue
-}
-```
-
-**⚠️ 不要用 `trap` 做兜底（2026-09-15 实测废弃）**
-
-早期版本用 `trap { Stop-BrowserAutomation; exit 1 }` 做全局异常兜底，**实测会误杀正常任务**：脚本内部的非终止性错误（例如单条候选人处理失败）也会触发 trap，导致整批任务被提前中断并停掉 daemon。
-
-**正确做法：幂等函数 + 多处显式调用**
-
-```powershell
-function Stop-BrowserAutomation {
-    param([switch]$Quiet, [switch]$KeepDaemon)
-    if ($Script:AutomationStopped) { return }   # ★ 幂等：重复调用直接返回
-    $Script:AutomationStopped = $true
-    ...
-}
-```
-
-调用时机：
-- ✔ 主流程正常结束（达标或候选池耗尽）后 —— **必须调用**
-- ✔ 显式捕获到的致命错误分支 —— 按需调用
-- ✘ 不要挂 `trap` 全局兜底
-- ✘ 不要在每个岗位之间调用（同一批次多岗位时应共用 daemon）
-
-> ⚠️ **注意**：`Stop-BrowserAutomation` 会停掉 daemon。如果同一批次要连续跑多个岗位，**不要**在每个岗位之间调用它 —— 只在**整批任务全部结束**时调用一次。若需要中间保持 daemon，可传 `-KeepDaemon` 跳过第 3 步。
-
-**汇总区同时输出达标状态**，便于 Agent 判断是否需要补跑：
-
-```
-=====================================
-  Success      : 100
-  Failed       : 0
-  Skipped      : 0
-  Format       : word
-  Target files : 100
-  Target goal  : 100
-=====================================
-  [DONE] Target reached (100/100).
-  Browser automation stopped.
-```
+- wrapper.ps1 内容 = E 节标准启动序列（daemon start → list_tabs 轮询等扩展重连 → 设 NO_PROXY → 运行 run.ps1）。**wrapper 必须纯 ASCII 路径**（中文放 config.json/数据文件，trash/命令行对中文路径有 GBK mojibake 坑）
+- `schtasks /create` 在本机报 exit -1，用 `Register-ScheduledTask` 替代
+
+## 配置项说明（`scripts/config.json`）
+
+| 键 | 说明 |
+|---|---|
+| `Url` | 智联推荐页完整 URL（含 jobNumber，去掉 `#` 片段） |
+| `JobName` | 岗位名称，需与页面标签完全一致 |
+| `DownloadDir` | 简历最终保存目录（绝对路径） |
+| `DownloadCount` | 目标下载数量 |
+| `FileFormat` | `"word"`（默认，生成 .docx）或 `"pdf"` |
+
+> `DownloadWaitMs` 已废弃（#55 后不再阻塞等待），保留键仅为兼容旧 config。
+
+## 下载主循环语义（已代码化，此处只述流程不述实现）
+
+主循环 = **卡片登记 + 顺序推进（#53/#54）**：
+
+1. **[A] 视觉识别**：DOM 提取视口所有卡片 → key = `姓名_年龄_工作经历摘要`（摘要=容器文本剔除易变时间词后前 30 字符）
+2. **[B] 双表过滤**：`$processed`（本次运行完整 key）+ `$prefilled`（断点续传 姓名_年龄）命中任一即跳过
+3. **[C] 点击与处理**：前台化 → 三重校验打标记 → DOM click → 确认面板 → 存至本地（探测到立即 CDP 点击，#46）→ word 切换 → 保存 → **release+1000ms 关面板（#55）** → 轮询检测落盘 → 移动去重 → 登记完毕
+4. **[D] 顺序推进**：视口消化完才下滚一屏（800ms，不回顶）；到底+连续 3 轮无新卡片 → 回顶重扫（推荐列表动态重排产生新卡片）；连续 3 空轮才停
+
+已知限制：同名同龄且摘要相同（理论上同一人）视为同一卡片；同名同龄不同经历可正确区分。
+
+## 时序参数（多轮踩坑调优值，勿随意压缩——每项都有原因）
+
+| 参数 | 值 | 原因 |
+|---|---|---|
+| CloseWaitMs | 700ms | 遮罩点击释放后等模态关闭 |
+| ClickWaitMs | 800ms | 点中卡片后等面板开始渲染 |
+| 存至本地按钮等待 | ≤30s（Wait-Until） | #45：按钮随简历正文加载延迟 10~15s 才挂载 |
+| DialogCheckWaitMs | 2000ms | 保存对话框弹出延迟；按钮闪烁期 12 次重试窗口（#46） |
+| ScrollWaitMs | 800ms | #53 用户指定（原 1200）；虚拟列表滞后由停滞轮数兜底 |
+| SaveCloseWaitMs | 1000ms | #55 用户指定：release 保存按钮后关面板前 |
+| 落盘轮询窗口 | word 25s / pdf 15s | word 文件生成更慢；每秒一查，命中基准 = 点击时刻-5s |
 
 ## 去重策略（关键规则）
 
@@ -871,17 +442,18 @@ if ($moved) {
 54. ✅ **卡片标识升级：姓名+年龄 极易重复 → 加入工作经历摘要（2026-09-15 用户指定）** → 用户指出智联推荐池大量脱敏同名卡（"张先生"）同龄极常见，姓名+年龄做 key 会误并不同候选人。**升级**：① 提取 JS 增加 `w` 字段——卡片容器文本剔除姓名/"N岁"/易变活跃时间词（刚刚/N秒钟前/N分钟前/N小时前/N天前/昨天/本周/本月/在线/活跃/看过）后取**前 30 字符**作摘要；剔除时间词是关键：推荐列表"12分钟前看过"类文案随时间变化，混入 key 会导致同一卡片跨重扫被视为新卡片反复点击；② key 升级为 `姓名_年龄_工作经历摘要`；③ `Get-CardMarkJs` 三重校验（姓名+年龄+摘要），匹配端用与提取端**完全相同的归一化链**（否则摘要跨被剔除词拼接时 indexOf 失配）；④ 断点续传因文件名不含工作经历，改用独立 `$prefilled`（姓名_年龄）基础表 + `$processed` 完整表双表过滤。**验证**：Node 模拟 DOM 冒烟测试——两个"张先生/34岁"不同公司卡片 key 正确区分、时间词 0 泄漏、标记 JS 精确命中目标卡片。**测试中抓到并修复 1 个拼接 bug**：`join("").` + 以 `.replace` 开头的归一化片段产生 `..` 双点 JS 语法错误（Invoke-Eval 会静默掩盖，靠 mock 测试暴露）。文件改动：`scripts/run.ps1`（$CardExtractJs、Get-CardMarkJs、$prefilled、[B]/[C] key 逻辑）。
 52. ✅ **#51 修复对运行中实例无效 + 重启后重复下载** → 用户再次观察到空转（idx 56-61 连续 6 个 SKIP）——**改 PS 脚本不影响已启动的实例**（脚本在启动时已解析进内存），必须停任务→改→重启才生效。重启又引入新问题：`$triedCandidates` 在内存里，重启后已下载的 45 人会被重新下载（每人 ~40s，45 份=30 分钟浪费）。**修复（双管齐下）**：① sweep 重试 25→10（单人 SKIP 代价 ~40s→~15s）；② **断点续传**——启动时扫描 `DownloadDir` 已有 `*.docx`，取文件名第一段（`_` 前的姓名）预填 `$triedCandidates`，日志输出 `[RESUME] N resume(s) already in target dir`；同名不同人风险由 `Move-OneResume` 的 DUP 三重验证（姓名+年龄+文件大小）兜底。③ 重启前把 config `DownloadCount` 减去目录已有份数（100-45=55），避免总数超 100。**运行中脚本热改无效**是 PS 脚本调度的通用陷阱，见问题 #51 教训的组合。
 55. ✅ **保存流程提速：release 保存按钮后 1000ms 即关闭详情面板（2026-09-15 用户指定）** → 原流程 release 后阻塞等待 `DownloadWaitMs`（word 模式强制 10s/人）才检测文件、关面板，单人固定等待成本过高。**新流程**：release → **Wait 1000ms** → 立即 `Close-ModalIfOpen` + `.km-modal__close-btn` DOM click 关闭详情面板 → 轮询检测新文件落盘（word 25s / pdf 15s 窗口，每秒一查，`LastWriteTime > clickTime-5s` 判定命中）。**配套**：面板关闭后无法重开重点保存，原 3 次保存重试 for 循环整体移除（单次点击失败走 [FAIL] 分支按已登记跳过）；文件命中基准改用点击前的 `$clickTime`（替代原 `Now-detectWindow` 滑动窗口，长轮询下更精确）。文件改动：`scripts/run.ps1` 3.6 节。
+56. ✅ **★★★ Skill 模块化重构：固定流程沉淀为脚本，文档只留经验（2026-09-15 用户指令）** → run.ps1 曾是 1337 行单体（客户端/页面交互/编排混杂），SKILL.md 用 400+ 行伪代码复述流程（与代码漂移、维护双份）。**新架构**：`lib/wb-core.ps1`（通用层：WebBridge 客户端、Write-Log 结构化日志、Invoke-WithRetry/Wait-Until 稳定性原语、Initialize-WebBridgeEnv 环境自检、Stop-BrowserAutomation、标签页管理）+ `lib/zhaopin-page.ps1`（页面层：选岗/验证、卡片提取与三重标记、模态与保存序列、文件移动去重）+ `run.ps1` 薄编排。**稳定性增强**：① 环境自检内建（list_tabs 真探测 + NO_PROXY + 等扩展重连 200s）；② deadline 制等待替代固定次数循环；③ 主循环 try/catch 单轮异常保护（连续 5 轮才终止）；④ 移动文件重试 3 次；⑤ 产物 `_summary.json`（机器可读 DONE/INCOMPLETE）+ `_run_log.txt`（UTF-8 结构化日志，替代 `*>` 重定向 UTF-16 痛点）；⑥ 明确退出码 0/1/2/3。**文档**：SKILL.md 893→约 460 行，删除流程伪代码与弃用章节，新增脚本架构/稳定性机制/长任务调度经验/时序参数表；删除弃用文件 config.ps1/webbridge-utils.ps1/download-loop.ps1/fix_config.py。**排障新知**：扩展掉线需用 list_tabs 真探测（snapshot "no tab" 会糊弄探测）；会话内后台任务约 2 分钟被宿主强杀→15 分钟级任务必须 Register-ScheduledTask 计划任务承载；safe-delete/trash 对中文路径报 GBK mojibake 错误（删除实际可能成功，需复核）；PS 工具与 Edit 工具均出现过"报成功未落盘"——所有关键写入必须 Grep/Read 复核。
 
 ## 绑定资源
 
-- `references/tech_details.md` — 页面结构、选择器、CDP 坐标、编码规范、完整踩坑记录
-- `scripts/run.ps1` — **主入口脚本（唯一入口，自包含所有逻辑）**
-- `scripts/config.json` — **JSON 配置文件（run.ps1 实际读取，Agent 执行前必须更新）**
-- `scripts/config.ps1` — [已弃用] 旧版 PS 配置文件
-- `scripts/webbridge-utils.ps1` — [已弃用] 函数已内建于 run.ps1
-- `scripts/download-loop.ps1` — [已弃用] 函数已内建于 run.ps1
-- `scripts/fix_config.py` — [已弃用] 编码修复辅助脚本（无硬编码路径，仅作备用）
+- `scripts/run.ps1` — **主编排入口**（配置校验/环境自检/主循环/汇总）
+- `scripts/lib/wb-core.ps1` — 通用层：WebBridge 客户端 + 稳定性原语 + 环境自检 + 清理
+- `scripts/lib/zhaopin-page.ps1` — 智联页面层：选岗/卡片/保存/文件函数库
+- `scripts/config.json` — 运行参数（Agent 执行前必须更新）
 - `assets/` — 可复用 JavaScript 模板
+- `references/tech_details.md` — 页面结构、选择器、CDP 坐标、编码规范、完整踩坑记录
+
+> 弃用文件（config.ps1 / webbridge-utils.ps1 / download-loop.ps1 / fix_config.py）已于 #56 删除。
 
 ## 跨环境可移植性
 
