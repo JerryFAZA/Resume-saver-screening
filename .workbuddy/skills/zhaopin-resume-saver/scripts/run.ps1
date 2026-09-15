@@ -40,7 +40,8 @@ if (Test-Path $jsonPath) {
         PressReleaseWaitMs = 400
         DialogCheckWaitMs  = 2000
         DownloadWaitMs     = 6000
-        ScrollWaitMs       = 1200
+        ScrollWaitMs       = 800   # ★ 优化（2026-09-15 用户指定）：滚动一屏等待 1200 → 800ms；
+                                   #   若虚拟列表加载跟不上导致停滞误判，由停滞阈值轮数兜底
         DownloadFilter = '*智联简历*'
         DownloadSource = "$env:USERPROFILE\Downloads"
     }
@@ -634,50 +635,24 @@ if (-not $listReady) {
 $null = Invoke-Eval 'window._SN = new Set()'
 Wait 300
 
-$minNeeded = [Math]::Max($Config.DownloadCount * 2, 40)  # 至少收集目标数×2 或 40 个
-$last      = 0
-$stag      = 0
-$maxScrolls = 80  # 硬上限防止死循环（deep list needs many scrolls）
-$stagnantLimit = 12  # ★ 修复：3 轮太激进，虚拟滚动偶发不增量会误判到底；提高到 12 轮
-$evalErrors = 0    # ★ 修复 #39：连续 evaluate 失败计数，用于区分离线/到底
-
-# ★ 关键修复：直接滚动列表容器（JS），而非 CDP mouseWheel 固定坐标。
-#   CDP mouseWheel 在 (500,600) 对虚拟列表滚动不可靠，会在 ~31 个时误判停滞。
-for ($i = 0; $i -lt $maxScrolls; $i++) {
-    $js = '(()=>{const c=document.querySelector(''.app-layout--default'')||document.scrollingElement;const e=document.querySelectorAll(''.talent-basic-info__name'');e.forEach(el=>{const m=el.textContent.trim().match(/^\S+/);if(m)window._SN.add(m[0])});if(c)c.scrollTop=c.scrollTop+900;else window.scrollBy(0,900);return ''''})()'
-    $null = Invoke-Eval $js
-    Wait $Config.ScrollWaitMs
-
-    $r = Invoke-Eval 'String(window._SN.size)'
-    if ($r -match '"ok":false') {
-        # ★ 修复 #39：evaluate 失败（tab 丢失/断连）不应静默跳过，否则循环空转到
-        #   maxScrolls 后报 0 个名字。这里显式重连并计数。
-        $evalErrors++
-        Write-Host "  Scroll $i : [EVAL ERROR] session/connection issue (errors=$evalErrors)" -ForegroundColor Yellow
-        if ($evalErrors -ge 3) {
-            Write-Host '  [WARN] 3 consecutive eval errors — re-navigating to recover...' -ForegroundColor Yellow
-            $null = Send-Web -Action 'navigate' -Payload @{ url = $Config.Url; newTab = $true; group_title = 'Zhaopin Resume Screening' }
-            Wait 4000
-            $null = Send-Web -Action 'cdp' -Payload @{ method = 'Page.bringToFront'; params = @{} }
-            Wait 3000
-            $null = Invoke-Eval 'window._SN = new Set()'
-            Wait 500
-            $evalErrors = 0
-        }
-        continue
-    }
-    if ($r -match '"value":"(\d+)"') {
-        $evalErrors = 0
-        $cur = [int]$Matches[1]
-        if ($cur -eq $last) { $stag++ } else { $stag = 0; $last = $cur }
-        Write-Host "  Scroll $i : size=$cur (stagnant=$stag)" -ForegroundColor Gray
-        # 收集够了就停，或连续多轮无新增（确认到底）才停
-        if ($cur -ge $minNeeded) { Write-Host "  Enough names collected, stopping." -ForegroundColor Green; break }
-        if ($stag -ge $stagnantLimit) { Write-Host "  Reached list end (stagnant limit)." -ForegroundColor Green; break }
-    } else {
-        Write-Host "  Scroll $i : [WARN] unparseable response" -ForegroundColor Yellow
-    }
+# ★ 优化 #53（2026-09-15）：下载主循环已改为「卡片登记 + 顺序推进」（见阶段 3），
+#   不再依赖预收集的全量姓名名单。此处仅收集一次视口内姓名做健康检查（列表非空即可），
+#   不再全列表滚动预收集——省去下载前最长 80 屏 × 等待的无效滚动；
+#   候选池耗尽检测由下载循环内「到底探测 + 回顶重扫 + 空轮计数」承担。
+$visNames = 0
+for ($vi = 0; $vi -lt 3; $vi++) {
+    $cr = Invoke-Eval '(()=>{window._SN=new Set();const e=document.querySelectorAll(".talent-basic-info__name");e.forEach(el=>{const m=el.textContent.trim().match(/^\S+/);if(m)window._SN.add(m[0])});return String(window._SN.size)})()'
+    if ($cr -match '"value":"(\d+)"') { $visNames = [int]$Matches[1]; break }
+    if ($cr -match '"ok":false') {
+        # ★ 沿用 #39 自愈：session 无标签页 → 重新导航并等待渲染
+        Write-Host '  [WARN] Session tab lost during collect — re-navigating...' -ForegroundColor Yellow
+        $null = Send-Web -Action 'navigate' -Payload @{ url = $Config.Url; newTab = $true; group_title = 'Zhaopin Resume Screening' }
+        Wait 4000
+        $null = Send-Web -Action 'cdp' -Payload @{ method = 'Page.bringToFront'; params = @{} }
+        Wait 2000
+    } else { Wait 1000 }
 }
+Write-Host "  Visible cards in viewport: $visNames" -ForegroundColor Gray
 
 # 解析姓名数组
 $names = @()
@@ -888,41 +863,133 @@ $ok          = 0
 $fail        = 0
 $skip        = 0
 $preExisting = 0
-$idx         = 0
-$triedCandidates = @{}
+# ★ 优化 #53/#54：卡片登记表（$processed），key = "姓名_年龄_工作经历摘要" → 已处理。
+#   语义：凡登记过的卡片视为"下载完毕"（含成功/失败/重复），主循环不再碰它。
+#   工作经历摘要（前 30 字符，剔除易变的活跃时间词）用于区分同名同龄的不同候选人。
+$processed   = @{}
+# ★ 断点续传基础登记表（$prefilled）：文件名只含 姓名+年龄（不含工作经历），
+#   故按 姓名_年龄 基础 key 预填；[B] 查找时同时比对两张表——命中任一即跳过。
+#   同名不同人的兜底仍由 Move-OneResume 的 DUP 三重验证（姓名+年龄+文件大小）承担。
+$prefilled   = @{}
+$resumeSkipped = 0
+if (Test-Path $Config.DownloadDir) {
+    foreach ($f in (Get-ZhaopinFiles $Config.DownloadDir)) {
+        $prevName = Get-NameFromZhilianFile $f.Name
+        $prevAge  = Get-AgeFromZhilianFile $f.Name
+        $prevKey  = "$prevName" + '_' + "$prevAge"
+        if ($prevName -and -not $prefilled.ContainsKey($prevKey)) {
+            $prefilled[$prevKey] = $true
+            $resumeSkipped++
+        }
+    }
+}
+if ($resumeSkipped -gt 0) {
+    Write-Host "[RESUME] $resumeSkipped resume(s) already in target dir — those cards will be skipped." -ForegroundColor Cyan
+}
 $isFirst     = $true  # 第一次迭代无需关闭模态
 
-# ★★★ 修复 #33：未达标前绝不停止 ★★★
-# 原实现 while ($ok -lt $targetCount -and $idx -lt $names.Count) 一遇到 $names 遍历完
-# 就退出（远早于目标数）。根因是收集阶段只拿到 31 个名字时，遍历 31 次即结束。
-# 现在引入"补收名字"机制：一轮遍历完仍未达标 → 重新滚动收集（阈值放宽）→ 继续下载，
-# 直到 ok >= targetCount，或连续 $maxEmptyRounds 轮确实没有任何新候选人可下载。
-$maxEmptyRounds = 3      # 连续 3 轮"没有任何新增成功/尝试"才认定候选池耗尽
-$emptyRounds    = 0
-$round          = 0
-$lastOk         = 0
+# ============================================================
+# ★★★ 优化 #53（2026-09-15，用户指定流程）：卡片登记 + 顺序推进 ★★★
+# ============================================================
+# 旧模式问题：维护姓名名单 + 每个候选人都从列表顶部全列表 sweep 查找（#34/#36 修复引入），
+#   名单过期时每人浪费最多 10 次 × 900ms 滚动空转（#51/#52），且虚拟列表对"回顶重扫"极不友好。
+# 新模式：
+#   ① 点开卡片前：视觉识别（DOM 提取）卡片关键信息（姓名+年龄）并检查登记表；
+#   ② 该卡片处理完毕（成功/失败/重复）：立即标记"下载完毕"（$processed）；
+#   ③ 关闭模态后：从当前位置直接寻找下一条未登记卡片点击下载，【不回滚到列表顶部】；
+#   ④ 视口内未处理卡片全部消化后才向下滚一屏（Wait ScrollWaitMs）；
+#   ⑤ 列表到底且连续 3 轮滚动无新卡片 → 回顶重扫一遍（推荐列表会动态重排，
+#      重排产生的新卡片不在登记表中，会被发现并下载），连续 $maxEmptyRounds 轮
+#      重扫均无新卡片才认定候选池耗尽（保留 #33"未达标绝不停止"精神）。
+# 已知限制（#54 升级后）：卡片 key = 姓名+年龄+工作经历摘要（前30字符），三要素全部相同
+# 才视为同一卡片；同名同龄但工作经历不同的候选人可被正确区分并分别下载。
+# 摘要稳定性：剔除空白/引号/反斜杠/"N岁"/易变活跃时间词（刚刚/N秒钟前/N分钟前/N小时前/
+# N天前/昨天/本周/本月/在线/活跃/看过）后取前 30 字符——推荐列表的"12小时前看过"类
+# 文案随时间变化，若混入 key 会导致同一卡片跨重扫被视为新卡片而重复点击（由 DUP 兜底，
+# 但浪费下载等待），故必须在提取与匹配两端使用完全相同的归一化链。
+$CardExtractJs = '(()=>{const out=[];const els=document.querySelectorAll(".talent-basic-info__name");els.forEach(el=>{const m=el.textContent.trim().match(/^\S+/);if(!m)return;const nm=m[0];let p=el,card=null,age="",i=0;while(p&&i<6){p=p.parentElement;if(!p)break;const a=p.textContent.match(/(\d{1,2})\u5c81/);if(a){age=a[1];card=p;break}}let w="";if(card){w=card.textContent.split(nm).join("").replace(/\s+/g,"").replace(/["\\]/g,"").replace(/\d{1,2}\u5c81/g,"").replace(/(\u521a\u521a|\d+\u79d2\u949f\u524d|\d+\u5206\u949f\u524d|\d+\u5c0f\u65f6\u524d|\d+\u5929\u524d|\u6628\u5929|\u672c\u5468|\u672c\u6708|\u5728\u7ebf|\u6d3b\u8dc3|\u770b\u8fc7)/g,"").substring(0,30)}out.push({n:nm,a:age,w:w})});return JSON.stringify(out)})()'
+
+<#
+.SYNOPSIS 生成"按 姓名+年龄+工作经历摘要 定位卡片并打临时标记"的 JS。
+.DESCRIPTION 候选人姓名/工作摘要做 \uXXXX 转义（编码安全，见 ConvertTo-JsSafeName）；
+  定位逻辑：向上遍历 6 层找到含 "N岁" 的卡片容器 → 校验目标年龄 →
+  用与 $CardExtractJs 完全相同的归一化链处理容器文本 → 校验工作摘要命中。
+  三重校验全部通过才打 data-wb-target 标记，确保同名同龄不同经历时点中正确卡片。
+#>
+function Get-CardMarkJs {
+    param([string]$Name, [string]$Age, [string]$Work)
+    $safeName = ConvertTo-JsSafeName -Name $Name
+    $safeWork = ConvertTo-JsSafeName -Name $Work
+    # ★ 与 $CardExtractJs 完全一致的归一化链（少一个 substring(0,30)）
+    $normTail = '.replace(/\s+/g,"").replace(/["\\]/g,"").replace(/\d{1,2}\u5c81/g,"").replace(/(\u521a\u521a|\d+\u79d2\u949f\u524d|\d+\u5206\u949f\u524d|\d+\u5c0f\u65f6\u524d|\d+\u5929\u524d|\u6628\u5929|\u672c\u5468|\u672c\u6708|\u5728\u7ebf|\u6d3b\u8dc3|\u770b\u8fc7)/g,"")'
+    $checks = ''
+    if ($Age) {
+        $checks = $checks + 'let p=el,i=0,card=null;while(p&&i<6){p=p.parentElement;if(!p)break;if(/(\d{1,2})\u5c81/.test(p.textContent)){card=p;break}}if(!card)continue;if(card.textContent.indexOf("' + $Age + '\u5c81")<0)continue;'
+        if ($Work) {
+            $checks = $checks + 'const norm=card.textContent.split("' + $safeName + '").join("")' + $normTail + ';if(norm.indexOf("' + $safeWork + '")<0)continue;'
+        }
+    }
+    return '(()=>{const els=document.querySelectorAll(".talent-basic-info__name");for(const el of els){const m=el.textContent.trim().match(/^\S+/);if(!m||m[0]!=="' + $safeName + '")continue;' + $checks + 'el.setAttribute("data-wb-target","1");return"ok"}return"no"})()'
+}
+
+$maxEmptyRounds  = 3      # 连续 3 轮"回顶重扫均无新卡片"才认定候选池耗尽
+$emptyRounds     = 0
+$round           = 0
+$lastOk          = 0
+$consecBottom    = 0      # 连续"滚动但列表已在底部且视口无未处理卡片"的轮数
+$scrollRounds    = 0
+$maxScrollRounds = 300    # 滚动硬上限防死循环
 
 while ($ok -lt $targetCount) {
     $round++
-    Write-Host ''
-    Write-Host "===== Round $round : $ok/$targetCount downloaded, $($names.Count) names in pool =====" -ForegroundColor Magenta
 
-    $attemptedThisRound = 0
-    while ($ok -lt $targetCount -and $idx -lt $names.Count) {
-        $name = $names[$idx]
-        $idx++
-        $attemptedThisRound++
+    # ============================================================
+    # [A] 视觉识别：提取当前视口内所有卡片的关键信息（姓名 + 年龄）
+    # ============================================================
+    $cardsRaw = Invoke-Eval $CardExtractJs
+    if ($cardsRaw -match '"ok":false') {
+        # ★ 自愈（沿用 #43）：session 无标签页 → 重新导航回列表页，不静默空转
+        Write-Host '  [RECOVER] Session tab lost — re-navigating to list...' -ForegroundColor Yellow
+        $null = Send-Web -Action 'navigate' -Payload @{ url = $Config.Url; newTab = $false }
+        for ($rw = 0; $rw -lt 20; $rw++) {
+            $rchk = Invoke-Eval 'String(document.querySelectorAll(".talent-basic-info__name").length)'
+            if ($rchk -match '"value":"(\d+)"' -and [int]$Matches[1] -gt 0) { break }
+            Wait 500
+        }
+        Wait 800
+        continue
+    }
 
-        if ($triedCandidates.ContainsKey($name)) { continue }
+    $cards = @()
+    if ($cardsRaw -match '"value":"(\[.*\])"') {
+        try {
+            $json = $Matches[1] -replace '\\"', '"'
+            $cards = @( ($json | ConvertFrom-Json) | Where-Object { $_ -and $_.n } )
+        } catch {
+            Write-Host '  [WARN] Card info parse failed — treating viewport as empty' -ForegroundColor Yellow
+        }
+    }
+
+    # ============================================================
+    # [B] 从登记表中找出第一条"未下载完毕"的卡片（#54：key 含工作经历摘要）
+    # ============================================================
+    $next = $null
+    foreach ($c in $cards) {
+        $cKey = ($c.n + '_' + $c.a + '_' + $c.w)
+        # 双表过滤：$processed（本次运行完整 key）或 $prefilled（断点续传 姓名_年龄）命中即跳过
+        if (-not $processed.ContainsKey($cKey) -and -not $prefilled.ContainsKey(($c.n + '_' + $c.a))) { $next = $c; break }
+    }
+
+    if ($next) {
+        $consecBottom = 0
+        $name    = $next.n
+        $nameKey = $next.n + '_' + $next.a + '_' + $next.w
+        $wShow   = "$($next.w)"
+        if ($wShow.Length -gt 16) { $wShow = $wShow.Substring(0, 16) + '…' }
 
         Write-Host ''
-        Write-Host "[$ok/$targetCount] $name (idx=$idx/$($names.Count))" -ForegroundColor Cyan
-
-        # 预检：目标目录是否已有该候选人简历
-        # ★ 修复：智联列表只显示"张先生/李女士"这类脱敏名，同名不同人极常见。
-        #   按姓名预跳过会漏掉同名候选人 → 改为总是尝试下载，交给 Move-OneResume 的
-        #   三重验证（姓名+年龄+文件大小）判定，真正重复时返回 'dup' 且不计数。
-        #   仅当目录中同名文件已很多（>=3，几乎可确定同名候选人已全部覆盖）时才跳过，用于省时。
+        Write-Host "===== Round $round : $ok/$targetCount downloaded =====" -ForegroundColor Magenta
+        Write-Host "[$ok/$targetCount] $name ($($next.a)岁) work=$wShow — card info recorded, opening..." -ForegroundColor Cyan
 
         # 3.1 关闭模态（首次跳过，后续按需关闭）
         if (-not $isFirst) {
@@ -930,68 +997,31 @@ while ($ok -lt $targetCount) {
         }
         $isFirst = $false
 
-        # 3.2 查找并点击候选人
-        # ★ 修复：搜索时先重置到顶部再逐屏下滑，避免"已在底部还继续往下滚"的死循环。
-        #   策略：第 0 轮先回到顶部，之后每轮向下滚一屏；同时兼顾上/下双向兜底。
-        $found = $false
-        $safeName = ConvertTo-JsSafeName -Name $name
-        # ★ 修复 #44：先确保标签页在最前。若被其他标签页遮挡，Chrome 不会把
-        #   真实输入事件投递给隐藏的 render widget，任何点击都会静默失败。
+        # ============================================================
+        # [C] 点击该卡片：前台化 → JS 打标记（姓名+年龄双校验）→ DOM click
+        # ============================================================
+        # ★ 优化 #53：卡片就在视口内（[A] 刚提取），直接点击，不再从顶部全列表 sweep。
+        # ★ 沿用 #44 机制：Ensure-TabFocused（遮挡环境下输入事件被静默丢弃）+
+        #   setAttribute 打标记 + WebBridge `click` action（DOM 级派发，触发 Vue 合成事件）。
         Ensure-TabFocused
-        for ($retry = 0; $retry -lt 25; $retry++) {
-            # 第 0 轮：先归零到顶部，保证从列表开头开始找
-            if ($retry -eq 0) {
-                $null = Invoke-Eval '(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=0;return "ok"})()'
-                Wait 1200
-            }
-            # ★ 修复 #44：用 JS 定位候选人并打临时标记，再用 DOM 级 click 点击。
-            #   原实现在 evaluate 里调 `el.click()`——实测该 JS click 在智联这个
-            #   虚拟列表上**不会打开详情面板**（React 合成事件不响应程序化 click），
-            #   必须走 WebBridge 的 `click` action（派发真实 pointerdown/mousedown）。
-            $fjs = '(()=>{const e=document.querySelectorAll(''.talent-basic-info__name'');for(const el of e){if(el.textContent.trim().indexOf("' + $safeName + '")>=0){el.setAttribute("data-wb-target","1");return"ok"}}return"no"})()'
-            $fr = Invoke-Eval $fjs
-            if ($fr -match '"value":"ok"') {
-                Ensure-TabFocused
-                if (Invoke-Click '[data-wb-target="1"]') {
-                    $found = $true
-                    $null = Invoke-Eval '(()=>{const e=document.querySelector("[data-wb-target]");if(e)e.removeAttribute("data-wb-target");return"ok"})()'
-                    break
-                }
-                # DOM click 失败则清标记，继续尝试下一屏
-                $null = Invoke-Eval '(()=>{const e=document.querySelector("[data-wb-target]");if(e)e.removeAttribute("data-wb-target");return"ok"})()'
-            }
-
-            # ★ 修复 #43：检测"session 无标签页 / 列表未渲染"并自愈。
-            #   原实现只判断 '"value":"ok"'，evaluate 返回 ok:false（无 tab）时
-            #   会一路静默滚到 25 次重试结束 → 连续 [SKIP] 空转。
-            #   这里识别 ok:false，重新 navigate 回列表 URL 并等待渲染。
-            if ($fr -match '"ok":false') {
-                Write-Host '  [WARN] Session tab lost — re-navigating to list...' -ForegroundColor Yellow
-                $null = Send-Web -Action 'navigate' -Payload @{ url = $Config.Url; newTab = $false }
-                for ($rw = 0; $rw -lt 20; $rw++) {
-                    $rchk = Invoke-Eval 'String(document.querySelectorAll(".talent-basic-info__name").length)'
-                    if ($rchk -match '"value":"(\d+)"' -and [int]$Matches[1] -gt 0) { break }
-                    Wait 500
-                }
-                Wait 800
-                continue
-            }
-
-            # ★★ 修复 #34：每轮都从顶部重新开始逐屏下滑。
-            #   原实现只在第 0 轮归零，后续轮次继续在当前 scrollTop 上叠加，
-            #   一旦滚到底就永远停在底部 → 25 次重试全部空转（表现为日志刷屏
-            #   [SKIP] Not found in viewport 且一份都没点进去）。
-            #   现在改为"相对顶部定位"：offset = retry * 700，每次都从 0 重新滚到该偏移。
-            $offset = $retry * 700
-            $null = Invoke-Eval ('(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=' + $offset + ';else window.scrollTo(0,' + $offset + ');return "ok"})()')
-            Wait 900
+        $markJs = Get-CardMarkJs -Name $name -Age $next.a -Work $next.w
+        $fr = Invoke-Eval $markJs
+        $clicked = $false
+        if ($fr -match '"value":"ok"') {
+            Ensure-TabFocused
+            if (Invoke-Click '[data-wb-target="1"]') { $clicked = $true }
+            $null = Invoke-Eval '(()=>{const e=document.querySelector("[data-wb-target]");if(e)e.removeAttribute("data-wb-target");return"ok"})()'
         }
-        if (-not $found) {
-            Write-Host '  [SKIP] Not found after full-list sweep' -ForegroundColor Yellow
-            $triedCandidates[$name] = $true
+        if (-not $clicked) {
+            # 点击失败 → 登记后跳过（不重试 sweep，避免名单过期时逐人 40 秒空转，#52 教训）；
+            # 若连续失败过多，由 [D] 分支的回顶重扫机制自然恢复。
+            Write-Host '  [SKIP] Card click failed — marked processed, moving to next card' -ForegroundColor Yellow
+            $processed[$nameKey] = $true
             $skip++
             continue
         }
+        # ★ 已进入处理流程即登记"下载完毕"（成功/失败/重复统一登记，防止反复点击同一卡片）
+        $processed[$nameKey] = $true
         Wait $Config.ClickWaitMs
 
     # ============================================================
@@ -1091,7 +1121,7 @@ while ($ok -lt $targetCount) {
     }
     if (-not $hasDialog) {
         Write-Host '  [FAIL] No save dialog after 12 attempts' -ForegroundColor Red
-        $triedCandidates[$name] = $true
+        # ★ 优化 #53：该卡片已在点击成功后登记 $processed，此处直接跳过
         $fail++
         continue
     }
@@ -1144,8 +1174,10 @@ while ($ok -lt $targetCount) {
     # ★ 修复 #44：优先 DOM 级 click（".km-button--primary" 是保存按钮的稳定 class 片段），
     #   失败再退回坐标点击。遮挡环境下坐标点击会被静默丢弃。
     $downloaded = $false
-    for ($confirmRetry = 0; $confirmRetry -lt 3; $confirmRetry++) {
-        Ensure-TabFocused
+    # ★ 优化 #55：面板在 release 后 1000ms 即关闭，无法重开面板重试点击，
+    #   原 3 次重试循环已移除；单次点击失败由下方 [FAIL] 分支按已登记跳过。
+    $clickTime = [DateTime]::Now
+    Ensure-TabFocused
         # 用 JS 给"保存"按钮打临时标记，再用 DOM click 精确命中
         $markSave = Send-Web -Action 'evaluate' -Payload @{ code = '(()=>{const b=document.querySelectorAll("button");for(const x of b){if(x.textContent.trim()==="\u4fdd\u5b58"&&x.offsetWidth>0){x.setAttribute("data-wb-save","1");return"ok"}}return"no"})()' }
         $saveClicked = $false
@@ -1165,23 +1197,36 @@ while ($ok -lt $targetCount) {
         } else {
             Write-Host '  Clicked 保存 (DOM click)' -ForegroundColor Gray
         }
-        Wait $Config.DownloadWaitMs
+        # ★ 优化 #55（用户指定 2026-09-15）：release 保存按钮后仅 1000ms 即关闭详情面板，
+        #   不再阻塞等待 DownloadWaitMs（word 模式原强制 10s/人）。文件落盘改由下方
+        #   轮询检测承担——下载已由浏览器接管，面板关闭不影响其继续写盘。
+        Wait 1000
 
-        # ★ 纯 ASCII 结构匹配：不依赖中文字面量，避免 GBK 乱码导致匹配失败
-        $latestFile = Get-ZhaopinFiles $Config.DownloadSource |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        # 检测窗口：PDF 模式 15 秒，Word 模式 25 秒（Word 文件生成耗时更长）
-        $detectWindowSec = if ($Config.FileFormat -eq 'word') { 25 } else { 15 }
-        if ($latestFile -and $latestFile.LastWriteTime -gt [DateTime]::Now.AddSeconds(-$detectWindowSec)) {
-            $downloaded = $true
-            Write-Host "  [OK] Download detected: $($latestFile.Name)" -ForegroundColor Green
-            break
+        # 立即关闭详情面板：模态遮罩点击 + 关闭按钮 DOM click 兜底
+        Close-ModalIfOpen
+        Wait 500
+        $dm = Invoke-Eval '(()=>{const b=document.querySelector(".km-modal__close-btn");return b?"yes":"no"})()'
+        if ($dm -match '"value":"yes"') {
+            $null = Invoke-Click '.km-modal__close-btn'
+            Wait 800
         }
-        Write-Host "  No new download detected, retrying... (last matched: $($latestFile.Name))" -ForegroundColor Yellow
-    }
+
+        # 轮询检测新文件落盘（面板已关，不再重开重试点击；word 25s / pdf 15s 检测窗口）
+        $detectWindowSec = if ($Config.FileFormat -eq 'word') { 25 } else { 15 }
+        $dlDeadline = [DateTime]::Now.AddSeconds($detectWindowSec)
+        while ([DateTime]::Now -lt $dlDeadline) {
+            $latestFile = Get-ZhaopinFiles $Config.DownloadSource |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latestFile -and $latestFile.LastWriteTime -gt $clickTime.AddSeconds(-5)) {
+                $downloaded = $true
+                Write-Host "  [OK] Download detected: $($latestFile.Name)" -ForegroundColor Green
+                break
+            }
+            Start-Sleep -Milliseconds 1000
+        }
     if (-not $downloaded) {
         Write-Host '  [FAIL] Download did not complete (no new zhilian file appeared in Downloads)' -ForegroundColor Red
-        $triedCandidates[$name] = $true
+        # ★ 优化 #53：该卡片已在点击成功后登记 $processed，此处直接跳过
         $fail++
         continue
     }
@@ -1193,11 +1238,11 @@ while ($ok -lt $targetCount) {
         $ok++
     } elseif ($moveResult -eq 'dup') {
         Write-Host '  [DUP] Duplicate removed — trying next candidate' -ForegroundColor Yellow
-        $triedCandidates[$name] = $true
+        # ★ 优化 #53：该卡片已在点击成功后登记 $processed
     } else {
         # $null：Downloads 中未找到文件（或移动失败被占用）→ 文件留在 Downloads，需人工处理
         Write-Host '  [WARN] No file matched/moved — file stays in Downloads, check manually' -ForegroundColor Yellow
-        $triedCandidates[$name] = $true
+        # ★ 优化 #53：该卡片已在点击成功后登记 $processed
         $fail++
     }
 
@@ -1217,75 +1262,51 @@ while ($ok -lt $targetCount) {
         $null = Invoke-Click '.km-modal__close-btn'
         Wait 800
     }
-    }  # ← end inner while (idx over names)
-
-    # ============================================================
-    # ★★★ 修复 #33（续）：本轮名单遍历完，若未达标则补收名字继续 ★★★
-    # ============================================================
-    if ($ok -ge $targetCount) { break }
-
-    if ($ok -gt $lastOk) {
-        # 本轮有实际产出 → 重置空轮计数，继续补收
-        $emptyRounds = 0
     } else {
-        $emptyRounds++
-    }
-    $lastOk = $ok
-
-    if ($emptyRounds -ge $maxEmptyRounds) {
-        Write-Host ''
-        Write-Host "[STOP] $maxEmptyRounds consecutive rounds with no new downloads — candidate pool exhausted." -ForegroundColor Yellow
-        Write-Host "       Downloaded $ok / $targetCount. Proceeding to summary." -ForegroundColor Yellow
-        break
-    }
-
-    # 补收名字：重置 Set 与滚动位置，用放宽的阈值重新扫列表（列表会随滚动继续加载）
-    Write-Host ''
-    Write-Host "[TOP-UP] Still need $($targetCount - $ok) more — re-collecting names..." -ForegroundColor Magenta
-    $null = Invoke-Eval '(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=0;window.scrollTo(0,0);return "ok"})()'
-    Wait 2000
-
-    $null = Invoke-Eval 'window._SN = new Set()'
-    Wait 300
-    $last = 0; $stag = 0
-    # 补收阶段阈值放宽到 20 轮（比首轮更耐心），maxScrolls 翻倍
-    for ($i = 0; $i -lt ($maxScrolls * 2); $i++) {
-        $js = '(()=>{const c=document.querySelector(''.app-layout--default'')||document.scrollingElement;const e=document.querySelectorAll(''.talent-basic-info__name'');e.forEach(el=>{const m=el.textContent.trim().match(/^\S+/);if(m)window._SN.add(m[0])});if(c)c.scrollTop=c.scrollTop+900;else window.scrollBy(0,900);return ''''})()'
-        $null = Invoke-Eval $js
+        # ============================================================
+        # [D] 视口内没有未处理卡片 → 从当前位置继续向下滚动（★ 不回顶，优化 #53）
+        # ============================================================
+        # 先探测是否已到列表底部，再执行滚动（到底时滚动动作仍可能触发懒加载）。
+        $scrollPos = Invoke-Eval '(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(!c)return"0,0,0";return Math.round(c.scrollTop)+","+Math.round(c.clientHeight)+","+Math.round(c.scrollHeight)})()'
+        $atBottom = $false
+        if ($scrollPos -match '"value":"(\d+),(\d+),(\d+)"') {
+            $st = [int]$Matches[1]; $ch = [int]$Matches[2]; $sh = [int]$Matches[3]
+            if (($st + $ch) -ge ($sh - 50)) { $atBottom = $true }
+        }
+        $null = Invoke-Eval '(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=c.scrollTop+900;else window.scrollBy(0,900);return"ok"})()'
         Wait $Config.ScrollWaitMs
-        $r = Invoke-Eval 'String(window._SN.size)'
-        if ($r -match '"value":"(\d+)"') {
-            $cur = [int]$Matches[1]
-            if ($cur -eq $last) { $stag++ } else { $stag = 0; $last = $cur }
-            if ($stag -ge 20) { break }
+        $scrollRounds++
+        if ($scrollRounds -gt $maxScrollRounds) {
+            Write-Host "[STOP] Scroll hard limit ($maxScrollRounds rounds) reached — proceeding to summary." -ForegroundColor Yellow
+            break
+        }
+        if ($atBottom) { $consecBottom++ } else { $consecBottom = 0 }
+
+        if ($consecBottom -ge 3) {
+            # 到底且连续 3 轮滚动均无新未处理卡片 → 空轮判定
+            if ($ok -gt $lastOk) {
+                $emptyRounds = 0   # 本轮有实际产出 → 重置空轮计数
+            } else {
+                $emptyRounds++
+            }
+            $lastOk = $ok
+            if ($emptyRounds -ge $maxEmptyRounds) {
+                Write-Host ''
+                Write-Host "[STOP] $maxEmptyRounds consecutive re-scans with no new cards — candidate pool exhausted." -ForegroundColor Yellow
+                Write-Host "       Downloaded $ok / $targetCount. Proceeding to summary." -ForegroundColor Yellow
+                break
+            }
+            # ★ TOP-UP（保留 #33"未达标绝不停止"精神）：回顶重扫一遍。
+            #   推荐列表会动态重排，重排产生的新卡片不在 $processed 登记表中，
+            #   会被 [B] 发现并下载；已处理卡片被登记表自动过滤，不会重复下载。
+            Write-Host ''
+            Write-Host "[TOP-UP] No new cards at list bottom — back to top for re-scan ($emptyRounds/$maxEmptyRounds)..." -ForegroundColor Magenta
+            $null = Invoke-Eval '(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=0;window.scrollTo(0,0);return"ok"})()'
+            Wait 2500
+            $consecBottom = 0
         }
     }
-
-    # 合并新收集到的名字到总名单（保持原有顺序，只追加新出现的）
-    $newNames = @()
-    $r = Invoke-Eval 'JSON.stringify(Array.from(window._SN))'
-    if ($r -match '"value":"(\[.*\])"') {
-        try {
-            $json = $Matches[1] -replace '\\"', '"'
-            $raw  = $json | ConvertFrom-Json
-            $newNames = @($raw | Where-Object { $_ } | ForEach-Object { $_ -replace '\s', '' } | Where-Object { $_ })
-        } catch {}
-    }
-
-    $added = 0
-    foreach ($n in $newNames) {
-        if ($names -notcontains $n) { $names += $n; $added++ }
-    }
-    Write-Host "  [TOP-UP] +$added new names → pool now $($names.Count)" -ForegroundColor Magenta
-
-    # 重置索引，重新遍历扩容后的名单（已试过的候选人在 $triedCandidates 里会被跳过）
-    $idx = 0
-    $isFirst = $true
-
-    # 重建列表后回到顶部，保证查找从开头开始
-    $null = Invoke-Eval '(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=0;window.scrollTo(0,0);return "ok"})()'
-    Wait 2500
-}  # ← end outer while (ok < targetCount)
+}  # ← end main while (card-sequenced download, 优化 #53)
 
 # ============================================================
 # 清理与汇总

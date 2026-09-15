@@ -21,10 +21,73 @@ agent_created: true
 - 参数缺失时，**一次性列出所有缺失项**让用户补充，不要逐项追问。
 - **与 `zhaopin-resume-screening` 组合使用时**：下载完成后应无缝衔接评估流程，不得停顿等待用户催促。Agent 应在下载脚本运行期间预计算评估参数（SKILL_DIR、Python 路径、输出路径等）。
 
+## 🚨 环境前置检查（2026-09-15 新增，Agent 必读）
+
+### A. 代理劫持 curl（HTTP_PROXY 环境变量）
+- 若环境设置了 `HTTP_PROXY/HTTPS_PROXY`（如 `http://127.0.0.1:12887`），`curl.exe` 访问 `http://127.0.0.1:10086` 会被代理拦截，返回极具迷惑性的 `{"ok":..., "error":{"message":"upstream connect failed ... os error 10061"}}` —— **这是代理的错误响应，不是 daemon 的**。
+- **修复**：运行 `run.ps1` 前在同一会话设置 `$env:NO_PROXY = "127.0.0.1,localhost"`；Agent 手动 curl 调试时一律加 `--noproxy "*"`。
+- 诊断特征：`netstat` 查不到 10086 监听但 curl 仍返回 JSON 错误 → 响应来自代理。
+
+### B. daemon 随父进程被清理
+- 由短生命周期的 Agent 命令（如一次性 `kimi-webbridge.exe start`）启动的 daemon，可能在命令退出后被连带清理（表现为：启动日志正常、扩展握手成功，但约 1 分钟后端口无监听、进程消失，日志无任何崩溃记录）。
+- **修复**：用 `run_in_background` 的 PowerShell 常驻任务承载 daemon（`start` 后接 `Start-Sleep`），保证 daemon 父进程存活。
+- 注意 `run.ps1` 末尾的 `Stop-BrowserAutomation` 会执行 `daemon stop`——这是预期行为，后续如需浏览器需重新启动 daemon。
+
+### C. WebBridge 请求临时文件的编码
+- PowerShell 5.1 的 `Out-File -Encoding utf8` 写出**带 BOM** 的文件，daemon 解析 JSON 会报 `invalid character '茂'`（BOM 被当数据）。
+- **修复**：请求体一律用 `[System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))` 写无 BOM UTF-8。
+- curl 响应含中文时，**不要**用 `| Out-String` 捕获（PS 按 GBK 解码导致乱码双倍破坏）；用 `curl.exe --output 文件` 直写文件后用 Read 工具读取。
+
+### D. daemon 版本与扩展版本必须匹配
+- daemon v1.11.3 + 扩展 v2.0.9 握手成功（`hello from extension v2.0.9 (daemon v1.11.3)`）但请求异常。执行 `kimi-webbridge upgrade` 对齐后正常。
+
+### ⭐ E. 标准启动序列（一站式 checklist，Agent 必须按此顺序执行）
+
+以上 A-D 四个坑在 2026-09-15 实战中全部踩过、合计浪费约 40 分钟排查。**不要逐个踩完再修**，启动前一次性按下面顺序做完：
+
+```powershell
+# ① 版本对齐（防坑 D）：先 stop 再 upgrade，幂等
+& "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" stop 2>$null
+& "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" upgrade
+
+# ② 常驻承载 daemon（防坑 B）：必须用 run_in_background 的任务承载，
+#    命令 = start + 长时间 Start-Sleep（如 7200 秒），保证父进程存活
+& "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" start 2>&1 | Out-String; Start-Sleep -Seconds 7200
+
+# ③ 就绪探测（防坑 A）：等扩展重连（约 10-30 秒），循环探测必须 --noproxy
+$ok = $false
+for ($i=1; $i -le 12; $i++) {
+    Start-Sleep -Seconds 5
+    $probe = '{"action":"snapshot","args":{},"session":"probe"}'
+    [System.IO.File]::WriteAllText("$env:TEMP\wb-probe.json", $probe, [System.Text.UTF8Encoding]::new($false))
+    curl.exe -sS --noproxy "*" -X POST http://127.0.0.1:10086/command -H "Content-Type: application/json" --data-binary "@$env:TEMP\wb-probe.json" --output "$env:TEMP\wb-probe-res.json"
+    if (Select-String -Path "$env:TEMP\wb-probe-res.json" -Pattern '"ok":true' -Quiet) { $ok = $true; break }
+}
+if (-not $ok) { throw "WebBridge daemon/extension not ready after 60s" }
+
+# ④ 启动下载（防坑 A/B）：run_in_background + 会话内设 NO_PROXY
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$env:NO_PROXY = "127.0.0.1,localhost"; $env:no_PROXY = "127.0.0.1,localhost"
+& "$SKILL_DIR\scripts\run.ps1"
+```
+
+- ③ 探测通过 = daemon + 扩展 + 版本 + 代理四项全部就绪，此后再启动下载脚本。
+- 探测用临时 session 名即可；snapshot 是最轻量的探测 action。
+- **运行中脚本热改无效**：修改 run.ps1 后必须 stop 任务 → 重启才生效（PS 启动时已把脚本解析进内存）。
+
+### ⭐ F. 中断续传（2026-09-15 新增，run.ps1 已内置 #52）
+
+下载中断（手动停止/故障/名单过期）后重启会自动续传，无需手工干预：
+
+- 脚本启动时扫描 `DownloadDir` 已有 `*.docx`，按文件名首段（姓名）预填跳过名单，日志输出 `[RESUME] N resume(s) already in target dir`。
+- **Agent 唯一要做的事**：重启前把 `config.json` 的 `DownloadCount` 改为 `目标总数 - 目录已有份数`（如 100-87=13），否则会超额下载。
+- 同名不同人风险由 `Move-OneResume` 的 DUP 三重验证（姓名+年龄+文件大小）兜底；实测 45 份文件名无重名。
+- 下载中段出现连续 `[SKIP] Not found after full-list sweep` 后自动 `[STALE] ... breaking to TOP-UP` 重新收集名单——**这是预期自愈行为，不是故障**，不要手动干预；单次 SKIP 现在最多 ~15 秒（sweep 重试 25→10，#52）。
+
 ## 快速运行（Agent 执行准则）
 
 1. 更新 `scripts/config.json` 填入参数（**优先使用 config.json 传参，避免命令行内嵌 URL 导致 `&tab=` 被 cmd 误解析**）
-2. 确保 daemon 运行：`& "$env:USERPROFILE\.kimi-webbridge\bin\kimi-webbridge.exe" start`
+2. **按「环境前置检查 E」的标准启动序列执行**（版本对齐 → 后台常驻承载 daemon → `--noproxy` 就绪探测 → 启动下载），不要裸 `start` 后直接跑脚本——A-D 四个坑都已在实战中踩过
 3. **⭐ 编码保护（CRITICAL）**：`run.ps1` 已内置 `[Console]::OutputEncoding = UTF8`，但为防止 Agent 环境中中文 stdout 被截断，**Agent 调用时强烈建议前置设置编码**：
    ```powershell
    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -32,6 +95,7 @@ agent_created: true
    ```
    > **不要嵌套 `powershell -File`**，直接用 PS 工具的 `&` 调用运算符执行 `.ps1`。嵌套会导致子进程继承错误的控制台编码。
 4. 如果必须在命令行传参，URL 中的 `&` 需要用 `^&` 转义（cmd）或用单引号包裹（PowerShell）
+5. **中断重启**：见「环境前置检查 F」——先把 `DownloadCount` 改为 `目标总数 - 已有份数`，脚本自动跳过已下载姓名（`[RESUME]` 日志确认）
 
 ## 参数
 
@@ -173,8 +237,8 @@ powershell -ExecutionPolicy Bypass -File "$SKILL_DIR\scripts\run.ps1" `
 
 | 值 | 后缀 | 弹窗行为 | 等待时间 |
 |----|------|---------|---------|
-| `word`（默认） | `.docx` | 先点击"word"图标，再点"保存" | `DownloadWaitMs` 自动上调至 10000ms，检测窗口 25s |
-| `pdf` | `.pdf` | 直接点击"保存"按钮 | `DownloadWaitMs=6000ms`，检测窗口 15s |
+| `word`（默认） | `.docx` | 先点击"word"图标，再点"保存" | release 后 1000ms 关面板（#55），落盘轮询检测窗口 25s |
+| `pdf` | `.pdf` | 直接点击"保存"按钮 | release 后 1000ms 关面板（#55），落盘轮询检测窗口 15s |
 
 > **Word 模式（默认）**：智联"保存到本地"对话框包含两个文件格式选项 `pdf` 和 `word`，PDF 默认选中。脚本会自动用 `getBoundingClientRect()` 探测 "word" 图标坐标，CDP 真实鼠标点击切换；之后弹窗下方提示变为"支持 word 2010 及以上版本"，作为切换成功的验证信号。如果使用 `pdf` 格式则跳过此步骤直接保存。
 
@@ -198,9 +262,11 @@ powershell -ExecutionPolicy Bypass -File "$SKILL_DIR\scripts\run.ps1" `
 
 > 如 `click` 返回文本含"协作未上线"，忽略该提示，页面已正常切换。
 
-### 阶段 2：获取候选人列表
+### 阶段 2：获取候选人列表（⭐ 2026-09-15 简化）
 
-> **关键**：智联使用**虚拟滚动**，DOM 中始终仅保留约 20 个节点。需要多次滚动加载并累积去重收集姓名。
+> **⭐ 优化 #53**：下载主循环已改为「卡片登记 + 顺序推进」（见阶段 3），**不再依赖预收集的全量姓名名单**。本阶段仅做一次视口内姓名收集作为健康检查（列表非空即可，最多重试 3 次），**不再全列表滚动预收集**——省去下载前最长 80 屏 × 等待的无效滚动；候选池耗尽检测由下载循环的「到底探测 + 回顶重扫 + 空轮计数」承担。滚动一屏等待时间已由 1200ms 调整为 **800ms**（用户指定）。
+
+> **关键**：智联使用**虚拟滚动**，DOM 中始终仅保留约 20 个节点。
 
 **姓名提取方法**：使用正则 `/^\S+/` 匹配 `textContent.trim()` 后的第一个非空白序列：
 
@@ -255,7 +321,28 @@ window._SN = new Set();
 
 在循环中反复滚动 + 收集，直到 `Set.size` 不再增长（连续 12 轮无增量）或达到目标数量。
 
-### 阶段 3：逐条保存循环（含去重）
+### 阶段 3：逐条保存循环（⭐⭐ 2026-09-15 重构：卡片登记 + 顺序推进，不回顶）
+
+#### ⭐⭐ 优化 #53：新主循环流程（用户指定，替代旧"姓名名单 + 顶部 sweep"模式）
+
+**旧模式问题**：维护姓名名单 + 每个候选人都从列表顶部全列表 sweep 查找（#34/#36 引入），名单过期时每人最多浪费 10 次 × 900ms 滚动空转（#51/#52）。
+
+**新流程**（每轮循环）：
+
+1. **[A] 视觉识别卡片**：用 JS 提取当前视口内所有卡片的关键信息（**姓名 + 年龄 + 工作经历摘要**：年龄从卡片容器文本 `(\d{1,2})岁` 正则提取；工作经历摘要 = 容器文本剔除姓名/年龄/"N岁"及易变活跃时间词（刚刚/N秒钟前/N分钟前/N小时前/N天前/昨天/本周/本月/在线/活跃/看过）后取**前 30 字符**），返回 JSON 数组。
+2. **[B] 查登记表**：key = `姓名_年龄_工作经历摘要`，从 `$processed` 登记表中找出**第一条未登记**的卡片；同时比对 `$prefilled`（断点续传基础表，key = `姓名_年龄`）。
+3. **[C] 直接点击**：前台化（`Page.bringToFront`）→ JS 打标记（**三重校验**：姓名 `\uXXXX` 转义 + 年龄 + 工作经历摘要——匹配 JS 用与提取端完全相同的归一化链处理容器文本后 `indexOf` 校验摘要）→ WebBridge DOM `click`。**不再从顶部 sweep**——卡片就在视口内。点击成功后**立即登记** `$processed[key] = $true`（成功/失败/重复统一登记，防止反复点击同一卡片）。
+4. **处理段（3.2.5~3.9 沿用）**：确认面板 → 等按钮 → 存至本地（CDP）→ word → 保存 → 移动文件 → 关闭模态。**关闭后不回滚列表顶部**，直接进入下一轮 [A]。
+5. **[D] 视口无未处理卡片时**：从当前位置**继续向下滚一屏**（`scrollTop += 900`，等待 `ScrollWaitMs=800ms`），并做到底探测（`scrollTop+clientHeight >= scrollHeight-50`）。
+6. **池耗尽判定**：到底且**连续 3 轮**滚动无新卡片 → 空轮计数；**连续 3 轮空轮**（回顶重扫均无新卡片）才停止。回顶重扫时推荐列表会动态重排，重排产生的新卡片不在登记表中，会被 [B] 发现并下载（保留 #33"未达标绝不停止"精神）。
+
+**配套变更**：
+
+- **断点续传升级**：启动时扫描目标目录已有简历，按 `姓名_年龄` 预填 `$prefilled` 基础登记表（文件名不含工作经历，无法预填完整 key）；[B] 查找时 `$processed`（完整 key）与 `$prefilled`（基础 key）双表过滤，命中任一即跳过。
+- **`$triedCandidates` 已删除**，统一由 `$processed` 登记表承担；原「外层轮次 + 内层遍历 + 补收名单」双循环结构移除。
+- **已知限制（#54 升级后）**：卡片 key = 姓名+年龄+工作经历摘要（前 30 字符），**三要素全部相同才视为同一卡片**——同名同龄但工作经历不同的候选人可被正确区分并分别下载；仅剩同名+同龄+摘要前 30 字符恰好一致的极端情况视为同一卡片（受 DUP 三重验证兜底）。
+
+#### 旧版循环结构（已被 #53 取代，仅供排查历史日志参考）
 
 #### ⭐⭐ 循环结构：未达标绝不停止（2026-09-15 关键修复）
 
@@ -469,16 +556,19 @@ if (-not (Invoke-Click '[data-wb-word="1"]')) {
 }
 ```
 
-#### 3.6 保存文件
+#### 3.6 保存文件（★ #55：release 后 1000ms 即关面板）
 
 ```
-用 getBoundingClientRect() 探测"保存"按钮坐标（不要用 DOM.getBoxModel）
-同样先打 data-wb-save 标记 → DOM click → 失败退回 CDP 坐标点击
+先打 data-wb-save 标记 → DOM click → 失败退回 CDP 坐标点击（记录 $clickTime 基准）
 cdp: mouseMoved   → (sx, sy)  等待 200ms
 cdp: mousePressed → (sx, sy)  等待 80ms
-cdp: mouseReleased→ (sx, sy)  等待 5-6 秒（确保文件写入完成）
+cdp: mouseReleased→ (sx, sy)  等待 1000ms（用户指定，不再阻塞等 DownloadWaitMs）
+→ 立即关闭详情面板（Close-ModalIfOpen + .km-modal__close-btn DOM click 兜底）
+→ 轮询检测新文件落盘（word 25s / pdf 15s 窗口，每秒查一次 Downloads，
+   文件 LastWriteTime > clickTime-5s 判定命中）
 ```
 
+> ⚠️ 面板关闭后**无法重开重点保存**，原 3 次重试循环已随 #55 移除；下载已由浏览器接管，面板关闭不影响继续写盘。
 > ⚠️ 面板内的所有按钮（存至本地 / word / 保存）**都不能用 JS `.click()`**。DOM click 对部分按钮有效，但**存至本地按钮必须用 CDP 真实鼠标事件**。统一策略：先试 DOM click，失败即退回 CDP 坐标点击。
 
 #### 3.7 移动文件 + 去重检查
@@ -771,6 +861,16 @@ if ($moved) {
     **重要**：此处**不能**用 DOM `click` 点"存至本地"——tech_details #21 已记录"不能用 JS `.click()`，Vue 组件需要真实鼠标事件"，实测 DOM click 返回 `success` 但不弹对话框。**候选人姓名用 DOM click，面板内按钮用 CDP 坐标点击**，二者不可混用。
     **实测结果**：`Success: 5 / Failed: 0 / Skipped: 1`，`[DONE] Target reached (5/5)`，并正确执行 `[9] Stopping browser automation...`（tab 关闭 + CDP 断开 + daemon 停止，端口 10086 拒绝连接）。产出 5 份 .docx（91568~276810 字节）。
     **重试次数**：3.4 阶段从 4 次提到 **12 次**，配合"面板关闭则重开"逻辑。
+47. ✅ **daemon 请求全部失败但日志显示握手正常 → HTTP_PROXY 代理劫持** → 根因：环境变量 `HTTP_PROXY=http://127.0.0.1:12887` 使 `curl.exe` 把发往 `127.0.0.1:10086` 的请求全部交给本地代理，代理连不上目标时返回伪装成 daemon 错误的 `upstream connect failed (os error 10061)`。**修复**：运行前设 `$env:NO_PROXY="127.0.0.1,localhost"`；调试 curl 一律加 `--noproxy "*"`。详见"环境前置检查 A"。
+48. ✅ **daemon 启动后约 1 分钟静默消失（端口无监听、日志无崩溃记录）** → 根因：daemon 由 Agent 的一次性命令启动，命令进程退出时子进程被连带清理。**修复**：用后台常驻任务（`start` + `Start-Sleep`）承载 daemon。另注意 run.ps1 结尾 `Stop-BrowserAutomation` 会主动 `daemon stop`（预期行为）。详见"环境前置检查 B"。
+49. ✅ **WebBridge 请求 JSON 带 BOM → `invalid character '茂'`** → 根因：PS 5.1 `Out-File -Encoding utf8` 写出带 BOM 文件，daemon 把 BOM 字节当 JSON 数据。**修复**：用 `[System.IO.File]::WriteAllText(..., UTF8Encoding::new($false))`；curl 响应用 `--output` 直写文件避免 Out-String 的 GBK 双重破坏。详见"环境前置检查 C"。
+50. ✅ **daemon v1.11.3 + 扩展 v2.0.9 版本错配** → 扩展升级后旧 daemon 无法正常转发（握手成功但请求失败）。**修复**：执行 `kimi-webbridge upgrade` 对齐版本。详见"环境前置检查 D"。
+51. ✅ **下载中段连续 `[SKIP] Not found after full-list sweep` 空转（用户观察："拉到最下方然后重置，往复循环，并未下载新简历"）** → 根因：收集阶段的姓名快照会过期——智联推荐列表动态重排/刷新，部分旧名字已不在列表中；查找逻辑对每个找不到的名字做 25 次重试 × 900ms 全列表往返扫描（相对顶部定位 0→底），单人浪费约 40 秒，且 SKIP 风暴可能连续持续 7+ 人（实测 idx 43-50 连续 7 个 SKIP 后在 idx 51 自愈）。**修复**：新增 `$consecSkip` 连续 SKIP 计数——找到候选人即清零；**连续 ≥8 个 SKIP 视为名单过期，立即 break 内层循环进入 TOP-UP 重新收集新名单**，不再逐个空扫剩余名单。当前运行中的实例不受影响（PS 脚本启动时已解析进内存），修改对下次运行生效。
+52. ✅ **查找候选人 sweep 重试 25 → 10**（配合 #51）：25 次 × 900ms 全列表往返在名单过期时空转成本过高，压缩到 10 次（覆盖顶部 ~7000px）。（注：本条后续被 #53 的"取消 sweep"整体取代）
+53. ✅ **★★★ 主循环重构：卡片登记 + 顺序推进，下载后不再回滚列表顶部（2026-09-15 用户指定流程）** → 旧模式（姓名名单 + 每人从顶部 sweep）效率低且名单易过期。**新流程**：① 点开卡片前视觉识别（DOM 提取）卡片关键信息（姓名+年龄）；② 处理完毕（成功/失败/重复）立即登记 `$processed["姓名_年龄"]`；③ 关闭模态后从当前位置直接寻找下一条未登记卡片点击，**不回顶**；④ 视口消化完才下滚一屏（ScrollWaitMs **1200→800ms**，用户指定）；⑤ 到底且连续 3 轮无新卡片 → 回顶重扫，连续 3 轮空轮才停（保留 #33 精神）。配套：断点续传按 姓名+年龄 精确预填；删除 `$triedCandidates`/双循环/补收名单逻辑；阶段 2 全列表预收集简化为视口健康检查。**已知限制**：同名同龄不同人视为同一卡片（与文件三重去重口径一致）。文件改动：`scripts/run.ps1`（ScrollWaitMs、阶段 2 收集段、阶段 3 初始化与主循环、SKILL.md 工作流章节）。
+54. ✅ **卡片标识升级：姓名+年龄 极易重复 → 加入工作经历摘要（2026-09-15 用户指定）** → 用户指出智联推荐池大量脱敏同名卡（"张先生"）同龄极常见，姓名+年龄做 key 会误并不同候选人。**升级**：① 提取 JS 增加 `w` 字段——卡片容器文本剔除姓名/"N岁"/易变活跃时间词（刚刚/N秒钟前/N分钟前/N小时前/N天前/昨天/本周/本月/在线/活跃/看过）后取**前 30 字符**作摘要；剔除时间词是关键：推荐列表"12分钟前看过"类文案随时间变化，混入 key 会导致同一卡片跨重扫被视为新卡片反复点击；② key 升级为 `姓名_年龄_工作经历摘要`；③ `Get-CardMarkJs` 三重校验（姓名+年龄+摘要），匹配端用与提取端**完全相同的归一化链**（否则摘要跨被剔除词拼接时 indexOf 失配）；④ 断点续传因文件名不含工作经历，改用独立 `$prefilled`（姓名_年龄）基础表 + `$processed` 完整表双表过滤。**验证**：Node 模拟 DOM 冒烟测试——两个"张先生/34岁"不同公司卡片 key 正确区分、时间词 0 泄漏、标记 JS 精确命中目标卡片。**测试中抓到并修复 1 个拼接 bug**：`join("").` + 以 `.replace` 开头的归一化片段产生 `..` 双点 JS 语法错误（Invoke-Eval 会静默掩盖，靠 mock 测试暴露）。文件改动：`scripts/run.ps1`（$CardExtractJs、Get-CardMarkJs、$prefilled、[B]/[C] key 逻辑）。
+52. ✅ **#51 修复对运行中实例无效 + 重启后重复下载** → 用户再次观察到空转（idx 56-61 连续 6 个 SKIP）——**改 PS 脚本不影响已启动的实例**（脚本在启动时已解析进内存），必须停任务→改→重启才生效。重启又引入新问题：`$triedCandidates` 在内存里，重启后已下载的 45 人会被重新下载（每人 ~40s，45 份=30 分钟浪费）。**修复（双管齐下）**：① sweep 重试 25→10（单人 SKIP 代价 ~40s→~15s）；② **断点续传**——启动时扫描 `DownloadDir` 已有 `*.docx`，取文件名第一段（`_` 前的姓名）预填 `$triedCandidates`，日志输出 `[RESUME] N resume(s) already in target dir`；同名不同人风险由 `Move-OneResume` 的 DUP 三重验证（姓名+年龄+文件大小）兜底。③ 重启前把 config `DownloadCount` 减去目录已有份数（100-45=55），避免总数超 100。**运行中脚本热改无效**是 PS 脚本调度的通用陷阱，见问题 #51 教训的组合。
+55. ✅ **保存流程提速：release 保存按钮后 1000ms 即关闭详情面板（2026-09-15 用户指定）** → 原流程 release 后阻塞等待 `DownloadWaitMs`（word 模式强制 10s/人）才检测文件、关面板，单人固定等待成本过高。**新流程**：release → **Wait 1000ms** → 立即 `Close-ModalIfOpen` + `.km-modal__close-btn` DOM click 关闭详情面板 → 轮询检测新文件落盘（word 25s / pdf 15s 窗口，每秒一查，`LastWriteTime > clickTime-5s` 判定命中）。**配套**：面板关闭后无法重开重点保存，原 3 次保存重试 for 循环整体移除（单次点击失败走 [FAIL] 分支按已登记跳过）；文件命中基准改用点击前的 `$clickTime`（替代原 `Now-detectWindow` 滑动窗口，长轮询下更精确）。文件改动：`scripts/run.ps1` 3.6 节。
 
 ## 绑定资源
 
