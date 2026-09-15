@@ -36,7 +36,7 @@ def parse_name(para_text):
 
 
 def parse_basic_info(para_text):
-    """从段落提取性别、年龄、现居地。"""
+    """从段落提取性别、年龄、现居地、工作年限、学历、求职状态。"""
     result = {}
 
     m = re.search(r'[｜|]\s*(男|女)\s*[｜|]', para_text)
@@ -56,6 +56,21 @@ def parse_basic_info(para_text):
 
     m = re.search(r'现居住地[：:]\s*(.+?)(?:[｜|\n])', para_text)
     result['current_residence'] = m.group(1).strip() if m else ""
+
+    # 基本信息行: 男｜38岁(1988年6月)｜11年｜本科｜离职-正在找工作
+    # 段序: 性别｜年龄(出生年月)｜工作年限｜学历｜求职状态
+    result['work_years'] = ""
+    result['education'] = ""
+    result['job_status'] = ""
+    m = re.search(r'^\s*[男女][｜|].+$', para_text, re.MULTILINE)
+    if m:
+        segs = [s.strip() for s in re.split(r'[｜|]', m.group(0).strip()) if s.strip()]
+        if len(segs) > 2 and re.match(r'^\d+年$', segs[2]):
+            result['work_years'] = segs[2]
+        if len(segs) > 3:
+            result['education'] = segs[3]
+        if len(segs) > 4:
+            result['job_status'] = segs[4]
 
     return result
 
