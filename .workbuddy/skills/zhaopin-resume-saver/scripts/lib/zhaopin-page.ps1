@@ -4,7 +4,8 @@
 # 依赖 wb-core.ps1（Send-Web/Invoke-Eval/Invoke-Click/Invoke-CDP/
 # Ensure-TabFocused/Wait/Wait-Until/ConvertTo-JsSafeName）。
 # 作用域契约：引用 run.ps1 的 $Config（含坐标兜底值/DownloadDir/
-# DownloadSource/FileFormat/CloseWaitMs/DialogCheckWaitMs/ScrollWaitMs）。
+# DownloadSource/FileFormat/CloseWaitMs/DialogCheckWaitMs/ScrollWaitMs/
+# ModalCloseRetryMax/ModalRetryWaitMs）。
 # 所有函数均为实战踩坑后验证过的版本，改动前先读 SKILL.md 对应问题记录。
 # ============================================================
 
@@ -29,33 +30,80 @@ function Get-SaveButtonCoords {
 # 阶段 1：导航 + 岗位选择 + 岗位验证
 # ------------------------------------------------------------
 
-# 返回 $true=点击成功；$false=15 轮未命中（调用方负责 FATAL 退出）
+# 激活岗位名是否匹配目标（#61：去括号后缀 + 精确/包含两种判定）
+function Test-JobActive {
+    param([string]$JobName)
+    $active = Get-ActiveJobName
+    if (-not $active) { return $false }
+    $a = $active.Trim() -replace '\s*\(.*$', ''
+    $e = $JobName.Trim() -replace '\s*\(.*$', ''
+    if ($a -eq $e) { return $true }
+    if ($active.Trim().Contains($e)) { return $true }
+    return $false
+}
+
+# 清除岗位卡临时标记
+function Remove-JobMark {
+    $null = Invoke-Eval '(()=>{const e=document.querySelector("[data-wb-job]");if(e)e.removeAttribute("data-wb-job");return"ok"})()'
+}
+
+# #61 重构（问题1，2026-09-16）：岗位卡选择必须"点击生效 + 激活岗位名验证匹配"才算成功。
+# 根因：旧版只发一次 JS click 就返回成功，Vue 组件可能忽略合成 click 事件，
+# 激活岗位根本没切换 → 后续按错误岗位的推荐池下载（26091609 晨批事故根因之一）。
+# 现行：优先精确匹配岗位名（includes 模糊仅兜底），三级点击升级——
+#   ① JS click（合成事件）→ ② Invoke-Click DOM click → ③ CDP 真实鼠标事件；
+# 每级点击后都用 Test-JobActive 复核激活岗位名确实切换，未切换才试下一级。
+# 返回 $true=已点击且验证匹配；$false=重试耗尽（调用方必须 FATAL 退出）
 function Select-JobTab {
     param([string]$JobName)
-    $jobTabClicked = $false
     $safeJobName = ConvertTo-JsSafeName -Name $JobName
-    # 双路径策略（#28）：snapshot 包含匹配（支持带后缀岗位名）+ JS 模糊匹配兜底
-    for ($retrySnap = 0; $retrySnap -lt 15; $retrySnap++) {
-        # 路径 A: snapshot 包含匹配
-        $snap = Send-Web -Action 'snapshot' -Payload @{}
-        if ($snap -match '"name":"[^"]*' + [regex]::Escape($JobName) + '[^"]*","ref":"(@e\d+)"') {
-            $null = Send-Web -Action 'click' -Payload @{ selector = $Matches[1] }
-            Write-Log "job tab matched via snapshot: $($Matches[1])" -Level OK
-            $jobTabClicked = $true
-            break
+    for ($retry = 0; $retry -lt 15; $retry++) {
+        # 查找岗位卡：优先精确匹配，退而 includes 模糊；命中即打 data 标记
+        $findJs = '(()=>{const items=document.querySelectorAll(''.job-pane__item'');let exact=null,fuzzy=null;for(const l of items){const t=l.textContent.trim();if(t==="' + $safeJobName + '"){exact=l;break}if(!fuzzy&&t.includes("' + $safeJobName + '")){fuzzy=l}}const el=exact||fuzzy;if(!el)return"no";el.setAttribute("data-wb-job","1");return(exact?"exact:":"fuzzy:")+el.textContent.trim().substring(0,40)})()'
+        $fr = Invoke-Eval $findJs
+        if ($fr -match '"value":"(exact|fuzzy):(.*?)"') {
+            $kind = $Matches[1]
+            Write-Log "job card found ($kind): $($Matches[2])" -Level INFO
+            # 一级：JS click（合成事件，开销最小）
+            $null = Invoke-Eval '(()=>{const e=document.querySelector("[data-wb-job]");if(e){e.click();return"ok"}return"no"})()'
+            Wait 1500
+            if (Test-JobActive -JobName $JobName) {
+                Remove-JobMark
+                Write-Log 'job switched (verified via active name) [js click]' -Level OK
+                return $true
+            }
+            # 二级：DOM click（WebBridge click action，DOM 级派发）
+            Ensure-TabFocused
+            if (Invoke-Click '[data-wb-job="1"]') {
+                Wait 1500
+                if (Test-JobActive -JobName $JobName) {
+                    Remove-JobMark
+                    Write-Log 'job switched (verified via active name) [dom click]' -Level OK
+                    return $true
+                }
+            }
+            # 三级：CDP 真实鼠标事件点元素中心（Vue 对合成事件免疫时的最终手段）
+            $cr = Invoke-Eval '(()=>{const e=document.querySelector("[data-wb-job]");if(!e)return"0,0";const r=e.getBoundingClientRect();return Math.round(r.x+r.width/2)+","+Math.round(r.y+r.height/2)})()'
+            $c = Parse-Coords $cr
+            if ($c) {
+                Ensure-TabFocused
+                Invoke-CDP -Type 'mouseMoved'    -X $c[0] -Y $c[1]
+                Invoke-CDP -Type 'mousePressed'  -X $c[0] -Y $c[1] -Button 'left'
+                Wait 80
+                Invoke-CDP -Type 'mouseReleased' -X $c[0] -Y $c[1] -Button 'left'
+                Wait 2000
+                if (Test-JobActive -JobName $JobName) {
+                    Remove-JobMark
+                    Write-Log 'job switched (verified via active name) [cdp mouse]' -Level OK
+                    return $true
+                }
+            }
+            Write-Log "job card click did not take effect (round $($retry + 1)/15) - retrying..." -Level WARN
         }
-        # 路径 B: JS evaluate 模糊匹配 .job-pane__item
-        $jsFindTab = '(()=>{const links=document.querySelectorAll(''.job-pane__item'');for(const l of links){if(l.textContent.trim().includes("' + $safeJobName + '")){l.click();return"ok:"+l.textContent.trim().substring(0,40)}}return"no"})()'
-        $ftResult = Invoke-Eval $jsFindTab
-        if ($ftResult -match '"value":"ok:(.*?)"') {
-            Write-Log "job tab matched via JS fuzzy: $($Matches[1])" -Level OK
-            $jobTabClicked = $true
-            break
-        }
-        if ($retrySnap -eq 0) { Write-Log 'job tab not found yet, retry every 2s (max 15)...' -Level INFO }
+        if ($retry -eq 0) { Write-Log 'job card not found/verified yet, retry every 2s (max 15)...' -Level INFO }
         Wait 2000
     }
-    return $jobTabClicked
+    return $false
 }
 
 # 失败诊断：dump 页面上所有岗位标签
@@ -171,6 +219,33 @@ function Close-ModalIfOpen {
     Wait 200
     Invoke-CDP -Type 'mouseReleased' -X $Config.MaskCloseX -Y $Config.MaskCloseY -Button 'left'
     Wait $Config.CloseWaitMs
+}
+
+# #57：带验证的模态关闭——先执行一轮关闭（遮罩 + 关闭按钮兜底），再探测 .km-modal--open；
+# 仍未关闭则每 ModalRetryWaitMs(1000ms) 重试，上限 ModalCloseRetryMax(10) 次（防死循环）。
+# 返回 $true=已验证关闭；$false=超限仍未关闭（调用方决定是否继续，不阻断主流程）。
+function Close-ModalVerified {
+    Close-ModalIfOpen
+    Wait 500
+    $dm = Invoke-Eval '(()=>{const b=document.querySelector(".km-modal__close-btn");return b?"yes":"no"})()'
+    if ($dm -match '"value":"yes"') {
+        $null = Invoke-Click '.km-modal__close-btn'
+        Wait 800
+    }
+    for ($i = 1; $i -le $Config.ModalCloseRetryMax; $i++) {
+        $stillOpen = Invoke-Eval 'String(document.querySelector(".km-modal--open")?true:false)'
+        if ($stillOpen -notmatch '"value":"true"') { return $true }
+        Write-Log "modal still open - retry close $i/$($Config.ModalCloseRetryMax) (every $($Config.ModalRetryWaitMs)ms)" -Level WARN
+        Wait $Config.ModalRetryWaitMs
+        Close-ModalIfOpen
+        Wait 500
+        $dm = Invoke-Eval '(()=>{const b=document.querySelector(".km-modal__close-btn");return b?"yes":"no"})()'
+        if ($dm -match '"value":"yes"') {
+            $null = Invoke-Click '.km-modal__close-btn'
+            Wait 800
+        }
+    }
+    return $false
 }
 
 # ------------------------------------------------------------

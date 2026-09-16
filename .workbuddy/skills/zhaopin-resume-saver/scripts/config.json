@@ -1,7 +1,8 @@
 {
-    "FileFormat":  "word",
-    "Url":  "https://rd6.zhaopin.com/app/recommend?jobNumber=CC136786060J41007428302&tab=recommend",
-    "DownloadCount":  100,
-    "JobName":  "联想渠道经理-青岛",
-    "DownloadDir":  "C:\\Sinlein\\timeline\\260724 【人资】简历筛选\\output\\26091516"
+    "FileFormat": "word",
+    "Url": "https://rd6.zhaopin.com/app/recommend?jobNumber=CC136786060J41031060702&tab=recommend",
+    "DownloadTarget": 100,
+    "DownloadCount": 100,
+    "DownloadDir": "C:\\Sinlein\\timeline\\260724 【人资】简历筛选\\output\\26091609 ai产品经理",
+    "JobName": "AI产品经理"
 }

@@ -21,6 +21,16 @@ agent_created: true
 - 参数缺失时，**一次性列出所有缺失项**让用户补充，不要逐项追问。
 - **与 `zhaopin-resume-screening` 组合使用时**：下载完成后应无缝衔接评估流程，不得停顿等待用户催促。Agent 应在下载脚本运行期间预计算评估参数（SKILL_DIR、Python 路径、输出路径等）。
 
+### ⭐ 岗位确认铁律（#58 问题1，最高优先级）
+
+**Agent 收到下载指令后、启动 run.ps1 之前，必须完成岗位核对，禁止凭历史配置直接开跑：**
+
+1. **用户提供了 jobNumber/URL** → config.json 直接采用用户给的值（禁止沿用旧 URL/旧 jobNumber）。
+2. **用户只给了岗位名称（未给 URL）** → 必须先打开 `https://rd6.zhaopin.com/app/job`（职位管理页）或推荐页的 job-pane，找到与用户指令**名称一致**的岗位并取其 jobNumber；有歧义（多个相近岗位名）时**向用户确认后再跑**。
+3. **复用/修改旧 config.json 时** → 必须逐字段核对 Url 的 jobNumber 与本次指令的岗位是否对应（2026-09-15 实战教训：联想渠道经理与 AI产品经理两个岗位，因沿用了旧 URL 的 jobNumber 导致整整跑错岗位）。
+4. 脚本层兜底：run.ps1 岗位验证不匹配或探测失败即 FATAL exit 1（除非 config 显式 `AllowUnverifiedJob: true`）。**Agent 层核对是第一道防线，脚本兜底只是保险**。
+5. **脚本层主动选岗（#61，2026-09-16）**：run.ps1 [2] 阶段的 `Select-JobTab` 不再依赖 URL jobNumber 的正确性——它会**主动在页面 job-pane 中查找与 `JobName` 精确匹配的岗位卡并点击**（includes 模糊仅兜底），且每级点击后必须用激活岗位名复核"切换确实生效"，未生效则三级点击升级（JS click → DOM click → CDP 真实鼠标）。**即使 config URL 带错 jobNumber，也会被选岗动作纠正到正确岗位**；选岗成功后记录实际 jobNumber 到 `_summary.json`（`jobNumber` 字段）供溯源。
+
 ## 🚨 环境前置检查（2026-09-15 新增，Agent 必读）
 
 ### A. 代理劫持 curl（HTTP_PROXY 环境变量）
@@ -84,9 +94,10 @@ $env:NO_PROXY = "127.0.0.1,localhost"; $env:no_PROXY = "127.0.0.1,localhost"
 下载中断（手动停止/故障）后重启会自动续传，无需手工干预：
 
 - 脚本启动时扫描 `DownloadDir` 已有简历，按 `姓名_年龄`（从文件名解析）预填 `$prefilled` 基础表，与主循环 `$processed` 完整表双表过滤，日志输出 `[RESUME] N resume(s) already in target dir`。
-- **Agent 唯一要做的事**：重启前把 `config.json` 的 `DownloadCount` 改为 `目标总数 - 目录已有份数`（如 100-87=13），否则会超额下载。
+- **Agent 唯一要做的事**：config.json 写 `DownloadTarget`（跨重启恒定的总目标）即可——run.ps1 启动时自动折算 `本次目标 = DownloadTarget - 目录已有份数`（#62，2026-09-16 起），**不再需要手工改 DownloadCount**；仅当命令行显式传 `-DownloadCount` 时才跳过自动折算。
 - 同名不同人风险由 `Move-OneResume` 的 DUP 三重验证（姓名+年龄+文件大小）兜底；实测 45 份文件名无重名。
 - 主循环中 `[SKIP]`（点击失败登记跳过）、`[TOP-UP]`（到底回顶重扫）、`RECOVER`（session 自愈）都是**预期自愈行为，不是故障**，不要手动干预。
+- **停滞自动重启（#62，2026-09-16）**：run.ps1 内置停滞看门狗——`ok+fail+skip+dup` 连续 **300s** 无任何变化即判定卡住，exit 4 退出；计划任务 wrapper（`scripts/wb_run_wrapper.template.ps1`，部署于 `%TEMP%\wb_run_wrapper.ps1`）检测到 exit 3/4 后**自动重启 daemon 并续跑**（上限 8 轮），断点续传自动跳过已有简历。日志/状态文件：`%TEMP%\wb_wrapper_status.txt`（每轮 exit code）、`%TEMP%\wb_wrapper_fail.txt`（扩展未就绪）。
 
 ## 参数
 
@@ -157,7 +168,7 @@ SKILL_DIR = 本 SKILL.md 所在目录的绝对路径
 |---|---|
 | `scripts/run.ps1` | 主编排（薄层）：配置校验 → 环境自检 → 导航/岗位选择/验证 → 下载主循环 → 汇总。所有流程步骤在此串联 |
 | `scripts/lib/wb-core.ps1` | 通用层：WebBridge 客户端（Send-Web/Invoke-Eval/Invoke-Click/Invoke-CDP）、Write-Log 结构化日志（UTF-8 无 BOM 落盘）、Invoke-WithRetry / Wait-Until 稳定性原语、Initialize-WebBridgeEnv 环境自检、Stop-BrowserAutomation（幂等）、标签页管理（Switch-ToDetailTab/Clear-StaleDetailTabs）、ConvertTo-JsSafeName |
-| `scripts/lib/zhaopin-page.ps1` | 智联页面层：Select-JobTab 双路径选岗（#28）、Get-ActiveJobName 验证（#38）、卡片提取 + 三重校验标记（#53/#54）、Close-ModalIfOpen、存至本地/word/保存序列（#44/#45/#46/#55）、Get-ZhaopinFiles 结构化文件识别 + Move-OneResume 移动去重 |
+| `scripts/lib/zhaopin-page.ps1` | 智联页面层：Select-JobTab 双路径选岗（#28）、Get-ActiveJobName 验证（#38）、卡片提取 + 三重校验标记（#53/#54）、Close-ModalIfOpen / Close-ModalVerified（#57）、存至本地/word/保存序列（#44/#45/#46/#55）、Get-ZhaopinFiles 结构化文件识别 + Move-OneResume 移动去重 |
 | `scripts/config.json` | 运行参数（数据，非逻辑） |
 | `assets/*.txt` | 可复用 JS 模板（参考用，与 lib 内实现同源） |
 | `references/tech_details.md` | 页面结构、选择器、CDP 坐标、完整踩坑记录 |
@@ -173,9 +184,9 @@ SKILL_DIR = 本 SKILL.md 所在目录的绝对路径
 
 ### 产物与退出码
 
-- `<DownloadDir>\_summary.json`：机器可读结果 `{status: DONE|INCOMPLETE, ok, fail, skip, target, fileCount, format, finishedAt}` —— **Agent 判断是否补跑只看这个文件，不要解析日志**
+- `<DownloadDir>\_summary.json`：机器可读结果 `{status: DONE|STALL|INCOMPLETE, ok, fail, skip, dup, target, fileCount, format, jobNumber, finishedAt}` —— **Agent 判断是否补跑只看这个文件，不要解析日志**；`jobNumber` 为 #61 选岗后从 URL 读出的实际岗位号（溯源用）
 - `<DownloadDir>\_run_log.txt`：结构化日志
-- 退出码：**0**=达标完成 / **2**=未达标（候选池耗尽）/ **1**=参数或岗位致命 / **3**=环境致命
+- 退出码：**0**=达标完成 / **2**=未达标（候选池耗尽）/ **1**=参数或岗位致命 / **3**=环境致命 / **4**=停滞（#62 看门狗触发，wrapper 检测后自动重启续传）
 
 ## 快速运行（Agent 执行准则）
 
@@ -203,10 +214,11 @@ Start-ScheduledTask -TaskName "WbResumeDL"
 
 | 键 | 说明 |
 |---|---|
-| `Url` | 智联推荐页完整 URL（含 jobNumber，去掉 `#` 片段） |
-| `JobName` | 岗位名称，需与页面标签完全一致 |
+| `Url` | 智联推荐页完整 URL（含 jobNumber，去掉 `#` 片段）。带错 jobNumber 会被 #61 选岗动作纠正，但仍应填写正确值 |
+| `JobName` | 岗位名称，需与页面标签完全一致（#61 选岗按此名在 job-pane 精确匹配） |
 | `DownloadDir` | 简历最终保存目录（绝对路径） |
-| `DownloadCount` | 目标下载数量 |
+| `DownloadTarget` | **总目标份数（推荐）**：跨重启恒定，run.ps1 自动按已有份数折算本次目标（#62） |
+| `DownloadCount` | 本次目标份数（传统方式）；设置了 DownloadTarget 且未命令行传参时被自动折算覆盖 |
 | `FileFormat` | `"word"`（默认，生成 .docx）或 `"pdf"` |
 
 > `DownloadWaitMs` 已废弃（#55 后不再阻塞等待），保留键仅为兼容旧 config。
@@ -231,7 +243,9 @@ Start-ScheduledTask -TaskName "WbResumeDL"
 | 存至本地按钮等待 | ≤30s（Wait-Until） | #45：按钮随简历正文加载延迟 10~15s 才挂载 |
 | DialogCheckWaitMs | 2000ms | 保存对话框弹出延迟；按钮闪烁期 12 次重试窗口（#46） |
 | ScrollWaitMs | 800ms | #53 用户指定（原 1200）；虚拟列表滞后由停滞轮数兜底 |
-| SaveCloseWaitMs | 1000ms | #55 用户指定：release 保存按钮后关面板前 |
+| SaveCloseWaitMs | 3200ms | #57 用户指定：release 保存按钮后关面板前（原 #55 值 1000ms） |
+| ModalRetryWaitMs | 1000ms | #57 用户指定：模态未关闭时每 1000ms 重试关闭 |
+| ModalCloseRetryMax | 10 次 | #57：关闭重试上限防死循环，超限 WARN 后继续主流程 |
 | 落盘轮询窗口 | word 25s / pdf 15s | word 文件生成更慢；每秒一查，命中基准 = 点击时刻-5s |
 
 ## 去重策略（关键规则）
@@ -440,9 +454,15 @@ if ($moved) {
 52. ✅ **查找候选人 sweep 重试 25 → 10**（配合 #51）：25 次 × 900ms 全列表往返在名单过期时空转成本过高，压缩到 10 次（覆盖顶部 ~7000px）。（注：本条后续被 #53 的"取消 sweep"整体取代）
 53. ✅ **★★★ 主循环重构：卡片登记 + 顺序推进，下载后不再回滚列表顶部（2026-09-15 用户指定流程）** → 旧模式（姓名名单 + 每人从顶部 sweep）效率低且名单易过期。**新流程**：① 点开卡片前视觉识别（DOM 提取）卡片关键信息（姓名+年龄）；② 处理完毕（成功/失败/重复）立即登记 `$processed["姓名_年龄"]`；③ 关闭模态后从当前位置直接寻找下一条未登记卡片点击，**不回顶**；④ 视口消化完才下滚一屏（ScrollWaitMs **1200→800ms**，用户指定）；⑤ 到底且连续 3 轮无新卡片 → 回顶重扫，连续 3 轮空轮才停（保留 #33 精神）。配套：断点续传按 姓名+年龄 精确预填；删除 `$triedCandidates`/双循环/补收名单逻辑；阶段 2 全列表预收集简化为视口健康检查。**已知限制**：同名同龄不同人视为同一卡片（与文件三重去重口径一致）。文件改动：`scripts/run.ps1`（ScrollWaitMs、阶段 2 收集段、阶段 3 初始化与主循环、SKILL.md 工作流章节）。
 54. ✅ **卡片标识升级：姓名+年龄 极易重复 → 加入工作经历摘要（2026-09-15 用户指定）** → 用户指出智联推荐池大量脱敏同名卡（"张先生"）同龄极常见，姓名+年龄做 key 会误并不同候选人。**升级**：① 提取 JS 增加 `w` 字段——卡片容器文本剔除姓名/"N岁"/易变活跃时间词（刚刚/N秒钟前/N分钟前/N小时前/N天前/昨天/本周/本月/在线/活跃/看过）后取**前 30 字符**作摘要；剔除时间词是关键：推荐列表"12分钟前看过"类文案随时间变化，混入 key 会导致同一卡片跨重扫被视为新卡片反复点击；② key 升级为 `姓名_年龄_工作经历摘要`；③ `Get-CardMarkJs` 三重校验（姓名+年龄+摘要），匹配端用与提取端**完全相同的归一化链**（否则摘要跨被剔除词拼接时 indexOf 失配）；④ 断点续传因文件名不含工作经历，改用独立 `$prefilled`（姓名_年龄）基础表 + `$processed` 完整表双表过滤。**验证**：Node 模拟 DOM 冒烟测试——两个"张先生/34岁"不同公司卡片 key 正确区分、时间词 0 泄漏、标记 JS 精确命中目标卡片。**测试中抓到并修复 1 个拼接 bug**：`join("").` + 以 `.replace` 开头的归一化片段产生 `..` 双点 JS 语法错误（Invoke-Eval 会静默掩盖，靠 mock 测试暴露）。文件改动：`scripts/run.ps1`（$CardExtractJs、Get-CardMarkJs、$prefilled、[B]/[C] key 逻辑）。
-52. ✅ **#51 修复对运行中实例无效 + 重启后重复下载** → 用户再次观察到空转（idx 56-61 连续 6 个 SKIP）——**改 PS 脚本不影响已启动的实例**（脚本在启动时已解析进内存），必须停任务→改→重启才生效。重启又引入新问题：`$triedCandidates` 在内存里，重启后已下载的 45 人会被重新下载（每人 ~40s，45 份=30 分钟浪费）。**修复（双管齐下）**：① sweep 重试 25→10（单人 SKIP 代价 ~40s→~15s）；② **断点续传**——启动时扫描 `DownloadDir` 已有 `*.docx`，取文件名第一段（`_` 前的姓名）预填 `$triedCandidates`，日志输出 `[RESUME] N resume(s) already in target dir`；同名不同人风险由 `Move-OneResume` 的 DUP 三重验证（姓名+年龄+文件大小）兜底。③ 重启前把 config `DownloadCount` 减去目录已有份数（100-45=55），避免总数超 100。**运行中脚本热改无效**是 PS 脚本调度的通用陷阱，见问题 #51 教训的组合。
+52b. ✅ **#51 修复对运行中实例无效 + 重启后重复下载** → 用户再次观察到空转（idx 56-61 连续 6 个 SKIP）——**改 PS 脚本不影响已启动的实例**（脚本在启动时已解析进内存），必须停任务→改→重启才生效。重启又引入新问题：`$triedCandidates` 在内存里，重启后已下载的 45 人会被重新下载（每人 ~40s，45 份=30 分钟浪费）。**修复（双管齐下）**：① sweep 重试 25→10（单人 SKIP 代价 ~40s→~15s）；② **断点续传**——启动时扫描 `DownloadDir` 已有 `*.docx`，取文件名第一段（`_` 前的姓名）预填 `$triedCandidates`，日志输出 `[RESUME] N resume(s) already in target dir`；同名不同人风险由 `Move-OneResume` 的 DUP 三重验证（姓名+年龄+文件大小）兜底。③ 重启前把 config `DownloadCount` 减去目录已有份数（100-45=55），避免总数超 100。**运行中脚本热改无效**是 PS 脚本调度的通用陷阱，见问题 #51 教训的组合。
 55. ✅ **保存流程提速：release 保存按钮后 1000ms 即关闭详情面板（2026-09-15 用户指定）** → 原流程 release 后阻塞等待 `DownloadWaitMs`（word 模式强制 10s/人）才检测文件、关面板，单人固定等待成本过高。**新流程**：release → **Wait 1000ms** → 立即 `Close-ModalIfOpen` + `.km-modal__close-btn` DOM click 关闭详情面板 → 轮询检测新文件落盘（word 25s / pdf 15s 窗口，每秒一查，`LastWriteTime > clickTime-5s` 判定命中）。**配套**：面板关闭后无法重开重点保存，原 3 次保存重试 for 循环整体移除（单次点击失败走 [FAIL] 分支按已登记跳过）；文件命中基准改用点击前的 `$clickTime`（替代原 `Now-detectWindow` 滑动窗口，长轮询下更精确）。文件改动：`scripts/run.ps1` 3.6 节。
 56. ✅ **★★★ Skill 模块化重构：固定流程沉淀为脚本，文档只留经验（2026-09-15 用户指令）** → run.ps1 曾是 1337 行单体（客户端/页面交互/编排混杂），SKILL.md 用 400+ 行伪代码复述流程（与代码漂移、维护双份）。**新架构**：`lib/wb-core.ps1`（通用层：WebBridge 客户端、Write-Log 结构化日志、Invoke-WithRetry/Wait-Until 稳定性原语、Initialize-WebBridgeEnv 环境自检、Stop-BrowserAutomation、标签页管理）+ `lib/zhaopin-page.ps1`（页面层：选岗/验证、卡片提取与三重标记、模态与保存序列、文件移动去重）+ `run.ps1` 薄编排。**稳定性增强**：① 环境自检内建（list_tabs 真探测 + NO_PROXY + 等扩展重连 200s）；② deadline 制等待替代固定次数循环；③ 主循环 try/catch 单轮异常保护（连续 5 轮才终止）；④ 移动文件重试 3 次；⑤ 产物 `_summary.json`（机器可读 DONE/INCOMPLETE）+ `_run_log.txt`（UTF-8 结构化日志，替代 `*>` 重定向 UTF-16 痛点）；⑥ 明确退出码 0/1/2/3。**文档**：SKILL.md 893→约 460 行，删除流程伪代码与弃用章节，新增脚本架构/稳定性机制/长任务调度经验/时序参数表；删除弃用文件 config.ps1/webbridge-utils.ps1/download-loop.ps1/fix_config.py。**排障新知**：扩展掉线需用 list_tabs 真探测（snapshot "no tab" 会糊弄探测）；会话内后台任务约 2 分钟被宿主强杀→15 分钟级任务必须 Register-ScheduledTask 计划任务承载；safe-delete/trash 对中文路径报 GBK mojibake 错误（删除实际可能成功，需复核）；PS 工具与 Edit 工具均出现过"报成功未落盘"——所有关键写入必须 Grep/Read 复核。
+57. ✅ **保存后关面板时序优化：1000ms→3200ms + 关闭验证重试（2026-09-15 用户指令）** → **根因**：#55 的 1000ms 等待偏激进，个别保存请求尚未被浏览器完全接管就关面板有丢文件风险；且关闭动作（遮罩点击 + 关闭按钮兜底）执行后**无任何验证**——若模态未真正关闭，下一位候选人卡片点击会在遮挡状态下静默失败。**修复**：① `SaveCloseWaitMs` 1000→**3200ms**（用户指定）；② 新增 `Close-ModalVerified`（zhaopin-page.ps1）——执行一轮关闭后探测 `.km-modal--open`，仍未关闭则每 **1000ms**（用户指定）重试关闭，上限 10 次（防死循环），超限 WARN 后继续主流程（与原行为兼容，不阻断）；③ 3.6 保存后关面板与 3.8/3.9 双保险段统一改用该函数（幂等：模态已关闭时仅 2 次 eval 探测即返回）。**文件改动**：`scripts/lib/zhaopin-page.ps1`（新增 Close-ModalVerified + 作用域契约注释补 ModalCloseRetryMax/ModalRetryWaitMs）、`scripts/run.ps1`（$Config 增 ModalRetryWaitMs=1000 / ModalCloseRetryMax=10、SaveCloseWaitMs=3200、3.6 与 3.8/3.9 段改用验证函数）、SKILL.md（脚本架构表 / 时序参数表 / 本条）。
+58. ✅ **★★★ 岗位验证探测失败静默放行 → 下载了错误岗位的简历（2026-09-15 用户指令，问题1）** → **现象**：用户指令"下载 ai产品经理 岗位简历"，config 沿用了联想渠道经理的 jobNumber URL，JobName 虽改但页面实际激活岗位是联想渠道经理，脚本照跑不误，20+ 份联想简历落盘。**根因**：run.ps1 岗位验证段 `Get-ActiveJobName` 探测失败时走 `else` 分支仅 WARN "skipping verification (proceed with caution)" 即继续——#38 的"降级为警告"策略把最危险的场景（无法证明岗位正确）放行了。**修复**：探测失败 = 无法证明岗位正确 = **FATAL exit 1**；仅当 config.json 显式 `"AllowUnverifiedJob": true` 时才豁免。配套 SKILL.md 新增"岗位确认铁律"（Agent 层第一道防线：用户提供 jobNumber 才可直接用，只给岗位名必须先到职位管理页核对，复用旧 config 必须逐字段核对 jobNumber）。**文件改动**：`scripts/run.ps1`（验证段 else 分支）、SKILL.md（执行原则 + 本条）。
+59. ✅ **★★★ scrollTop 赋值不触发推荐列表懒加载 → 21 份即误判"候选池耗尽"（2026-09-15 用户指令，问题2）** → **现象**：AI产品经理岗位推荐池明明还有大量候选人（用户目视确认），主循环在 21/200 处连续 3 轮 TOP-UP 空扫后 STOP。**根因**（对照实验确认）：[D] 分支用 JS `scrollTop = scrollTop+900` 滚动——scrollTop 赋值**能移动视口但不触发列表懒加载**，scrollHeight 恒定 5350（约 21 张卡片高度），滚动即"到底"，回顶重扫时列表也不增长，3 轮空轮后误判耗尽。用 CDP `Input.dispatchMouseEvent`（mouseWheel）滚动时 scrollHeight 从 5350 一路涨到 66714+，候选人远不止 21 个。**修复**：① [D] 分支滚动改用 **CDP mouseWheel**（Ensure-TabFocused 置前 → 3 次小步 deltaY=1200 各 300ms → ScrollWaitMs）；② 新增 `$lastSh` 增长判据——本轮 scrollHeight 较上轮增长 >200px 说明懒加载仍生效，`$consecBottom` 归零绝不算空轮；只有"到底**且**列表不再增长"才计入到底计数；③ TOP-UP 回顶后 `$lastSh` 归零重置基线。**教训**：#33 的"JS scrollTop 滚动可靠"结论有时效性——页面懒加载实现会变化，滚动方案必须以 scrollHeight 是否增长做效果校验，不能盲信历史结论。**文件改动**：`scripts/run.ps1`（[D] 分支 + $lastSh 初始化 + TOP-UP 重置）、SKILL.md（本条）。
+60. ✅ **Send-Web 的 curl 无超时 → Stop-BrowserAutomation 清理环节永久挂起（2026-09-15 实测）** → **现象**：下载完成后脚本卡在 "stopping browser automation..." 超 5 分钟，_summary.json 永不落盘，计划任务一直 Running。**根因**：`Send-Web` 内 `curl.exe -s` 无 `-m` 超时，daemon stop 请求挂起（daemon 忙/扩展失联）时 curl 永久阻塞，脚本整个收尾被卡死。**修复**：curl 统一加 `-m 20 --noproxy '*'`——daemon 无响应时 20 秒后返回空，脚本继续走完汇总。**文件改动**：`scripts/lib/wb-core.ps1`（Send-Web）。
+61. ✅ **★★★ 岗位卡点击不验证生效 → 错岗位推荐池照跑（2026-09-16 用户指令，问题1 二次加固）** → **根因**：旧 `Select-JobTab` 对岗位卡只发一次 JS click 就返回成功，不验证激活岗位是否真的切换——Vue 组件可能忽略合成 click 事件，页面实际停留在错误岗位的推荐池（26091609 晨批：config URL 带联想渠道经理 jobNumber，脚本按"AI产品经理"指令照跑）。**修复**：① 选岗改为**精确匹配优先**（`textContent === JobName`，includes 模糊仅兜底）+ 打 `data-wb-job` 标记；② **三级点击升级**：JS click → `Invoke-Click` DOM click → CDP 真实鼠标事件，**每级点击后用 `Test-JobActive` 复核激活岗位名确实切换**（去括号后缀比较），未生效才试下一级；③ 选岗成功后读 `location.href` 的实际 jobNumber 写入 `_summary.json`（溯源）；④ run.ps1 [2] 阶段失败信息区分"找不到岗位卡"与"点击始终不生效"。**意义**：即使 Agent 层核对漏掉、config URL 带错 jobNumber，脚本也会被选岗动作纠正到正确岗位。**文件改动**：`scripts/lib/zhaopin-page.ps1`（Test-JobActive/Remove-JobMark 新增 + Select-JobTab 重构）、`scripts/run.ps1`（[2] 阶段 jobNumber 记录）、`scripts/config.json`（jobNumber 纠正为 CC136786060J41031060702）。
+62. ✅ **★★★ 卡住无进展时自动重启循环（2026-09-16 用户指令，问题2 加固）** → **背景**：daemon 约每 25 分钟静默冻结一次（curl 已有 20s 超时不至于永久挂起，但冻结期间所有请求失败 → 页面自愈循环空转），#58 的滚动修复被页面改版绕过时也会空转——此前这些场景都需人工发现并重启。**修复（三层）**：① **run.ps1 停滞看门狗**：`ok+fail+skip+dup` 四计数器任一变化=有卡片被处理=有进展；连续 **300s**（`StallTimeoutSec`，可配置）无变化 → 判定卡住，`status=STALL` 写入 _summary.json，**exit 4**；滚动硬上限（300 轮）与连续 5 轮异常终止也归入 stall（exit 4），仅"候选池真耗尽"保持 exit 2 不重启；② **wrapper 自动重启循环**：计划任务 wrapper 重写为最多 8 轮的循环——每轮重建 daemon（stop→start→list_tabs 轮询探测）→ 跑 run.ps1 → 按退出码决策：0/1/2 停止，3/4 重启续跑；每轮 exit code 写 `%TEMP%\wb_wrapper_status.txt`，日志改追加模式并带轮次分隔线；③ **断点续传自动折算**：config 新增 `DownloadTarget`（跨重启恒定总目标），run.ps1 启动时自动算 `本次目标 = DownloadTarget - 已有份数`，重启无需手工改 DownloadCount。**文件改动**：`scripts/run.ps1`（StallTimeoutSec + 看门狗 + 退出码 4 + summary 增 dup/jobNumber 字段）、`%TEMP%\wb_run_wrapper.ps1`（重写，模板存 `scripts/wb_run_wrapper.template.ps1`）、`scripts/config.json`（DownloadTarget）、SKILL.md（本条 + 中断续传节 + 配置表）。
 
 ## 绑定资源
 
@@ -459,7 +479,7 @@ if ($moved) {
 
 本 skill 可安装于项目本地目录（`.workbuddy/skills/`）或全局目录（`~\.workbuddy\skills\`），所有路径引用均基于脚本自身目录动态解析，无硬编码绝对路径：
 
-- `run.ps1` 使用 `$MyInvocation.MyCommand.Path` 定位同目录 `config.json`
-- 所有 WebBridge 函数内建于 `run.ps1`，不依赖 dot-source 其他 .ps1 模块
+- `run.ps1` 使用 `$MyInvocation.MyCommand.Path` 定位同目录 `config.json`，并 dot-source `lib\wb-core.ps1` / `lib\zhaopin-page.ps1`（#56）
+- 通用层与页面层函数集中于 `lib\` 模块，`run.ps1` 仅保留编排逻辑
 - 下载源（`$env:USERPROFILE\Downloads`）和守护进程路径（`~\.kimi-webbridge\bin\`）使用环境变量
 - Python 脚本全部通过 `sys.argv` 接收路径参数，不依赖固定位置

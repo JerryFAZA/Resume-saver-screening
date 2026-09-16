@@ -57,7 +57,8 @@ function Send-Web {
     $reqFile = Join-Path $env:TEMP ("wb-req-" + [Guid]::NewGuid().ToString('N') + ".json")
     [System.IO.File]::WriteAllText($reqFile, $body, $Utf8NoBom)
     try {
-        return curl.exe -s -X POST $Config.WebBridgeUrl -H 'Content-Type: application/json' --data-binary "@$reqFile"
+        # #58：-m 20 硬超时——daemon 无响应（如清理期 stop 挂起）时不至于永久阻塞整个脚本
+        return curl.exe -s -m 20 --noproxy '*' -X POST $Config.WebBridgeUrl -H 'Content-Type: application/json' --data-binary "@$reqFile"
     } finally {
         for ($d = 0; $d -lt 3; $d++) {
             try { Remove-Item $reqFile -Force -ErrorAction Stop; break }
