@@ -133,10 +133,12 @@ if (-not (Initialize-WebBridgeEnv)) {
 Write-Log 'navigating to recommend page...' -Level STEP
 # newTab=$true 确保创建新标签页并激活为 current tab
 $null = Send-Web -Action 'navigate' -Payload @{ url = $Config.Url; newTab = $true; group_title = 'Zhaopin Resume Screening' }
-Wait 3000
+# #63 启动提速：navigate 后固定 3s×2 → 800ms。依据：Select-JobTab 自带 15×2s 重试门、
+# [3] 段有列表渲染条件等待兜底——页面未就绪只会让选岗多试几轮，不会误判；
+# 固定长睡在页面秒开时纯属浪费（健康路径省 ~5s）
+Wait 800
 # bringToFront 强制浏览器 UI 切到 CDP 连接的标签页（不能用 find_tab/Target.activateTarget）
 Ensure-TabFocused
-Wait 3000
 
 # ============================================================
 # [2] 岗位选择 + 验证（#61 增强：点击必须"验证生效"才算选岗成功）
@@ -150,7 +152,8 @@ if (-not (Select-JobTab -JobName $Config.JobName)) {
     Stop-BrowserAutomation -Quiet
     exit 1
 }
-Wait 3000
+# #63 选岗成功后固定 3s → 1s：下方本就有 candidate list Wait-Until(10s) 条件门兜底
+Wait 1000
 
 # #61：记录点击选岗后的实际 URL jobNumber（点击正确岗位卡会纠正错误的 config Url，
 # 这里只记录用于溯源，不作为失败依据——岗位名验证才是判定标准）
@@ -243,7 +246,8 @@ if ($visNames -eq 0) {
 
 # 收集阶段不再滚动（#53：下载循环顺序推进自取），但重置到顶部保证从头开始
 $null = Invoke-Eval '(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=0;window.scrollTo(0,0);return "ok"})()'
-Wait 2500
+# #63 回顶后固定 2.5s → 1.2s：随后有兜底导航 + back-to-list Wait-Until 条件门，列表未渲染不会被误判
+Wait 1200
 
 # 清理历史残留详情标签页（#42/#43：绝不关 active 标签页）
 $staleClosed = Clear-StaleDetailTabs
@@ -287,6 +291,8 @@ $scrollRounds    = 0
 $maxScrollRounds = 300   # 滚动硬上限防死循环
 $consecErrors    = 0     # 单轮未预期异常连续计数（稳定性增强：防异常风暴）
 $maxConsecErrors = 5
+$consecRepair    = 0     # #64 页面崩溃连续修复计数（连续失败达上限 → exit 3 交 wrapper 重建 daemon）
+$maxConsecRepair = 3
 $detectedWindowSec = if ($Config.FileFormat -eq 'word') { $Config.FileDetectWordSec } else { $Config.FileDetectPdfSec }
 
 # #62 停滞看门狗：ok+fail+skip+dup 任一变化 = 有卡片被处理 = 有进展；
@@ -315,14 +321,21 @@ while ($ok -lt $targetCount) {
     # [A] 视觉识别：提取视口内所有卡片（姓名+年龄+工作经历摘要）
     # ============================================================
     $cardsRaw = Invoke-Eval $CardExtractJs
-    if ($cardsRaw -match '"ok":false') {
-        # 自愈（#43）：session 无标签页 → 重新导航回列表页
-        Write-Log 'RECOVER: session tab lost - re-navigating to list' -Level WARN
-        $null = Send-Web -Action 'navigate' -Payload @{ url = $Config.Url; newTab = $false }
-        $null = Wait-Until -TimeoutMs 10000 -PollMs 500 -Description 'recovered list render' -Condition { (Get-VisibleCardCount) -gt 0 }
-        Wait 800
+    # #64 网页崩溃检测：ok:false（tab 丢失/崩溃）或无 ok:true（响应无效/空，含 daemon 无响应）→ 自愈重建
+    $crashReason = ''
+    if ($cardsRaw -match '"ok":false')       { $crashReason = 'evaluate ok:false (tab lost/crashed)' }
+    elseif ($cardsRaw -notmatch '"ok":true') { $crashReason = 'evaluate invalid/empty response' }
+    if ($crashReason) {
+        $consecRepair++
+        if ($consecRepair -ge $maxConsecRepair) {
+            Write-Log "FATAL: crash recovery failed $consecRepair consecutive times - exiting for wrapper daemon rebuild (exit 3)" -Level FAIL
+            Stop-BrowserAutomation -Quiet -KeepDaemon
+            exit 3
+        }
+        if (Repair-PageCrash -Reason $crashReason) { $consecRepair = 0 }
         continue
     }
+    $consecRepair = 0
     $cards = @()
     if ($cardsRaw -match '"value":"(\[.*\])"') {
         try {
@@ -405,6 +418,14 @@ while ($ok -lt $targetCount) {
             (Invoke-Eval '(()=>{const b=document.querySelector(".resume-button.position-r");if(!b)return 0;const r=b.getBoundingClientRect();return(r.width>0&&r.height>0)?1:0})()') -match '"value":1'
         }
         if (-not $saveLocalReady) {
+            # #64：面板阶段页面崩溃 → 自愈重建。该卡片尚未执行任何保存动作，取消登记以便恢复后重试
+            if (-not (Test-PageAlive)) {
+                Write-Log 'page crashed during detail panel - repairing (card will be retried)' -Level FAIL
+                if (Repair-PageCrash -Reason 'crash during detail panel') {
+                    $processed.Remove($nameKey)
+                    continue
+                }
+            }
             Write-Log 'FAIL: save-local button never appeared (30s)' -Level FAIL
             $fail++
             continue

@@ -37,8 +37,10 @@ function Test-JobActive {
     if (-not $active) { return $false }
     $a = $active.Trim() -replace '\s*\(.*$', ''
     $e = $JobName.Trim() -replace '\s*\(.*$', ''
-    if ($a -eq $e) { return $true }
-    if ($active.Trim().Contains($e)) { return $true }
+    $a = $a -replace '\s*·.*$', ''   # 页面岗位标签带"·协作未上线"等点号后缀
+    $e = $e -replace '\s*·.*$', ''
+    if ($a -ieq $e) { return $true }          # 大小写不敏感（页面标签可能为小写 ai产品经理）
+    if ($a.ToLower().Contains($e.ToLower())) { return $true }
     return $false
 }
 
@@ -59,7 +61,7 @@ function Select-JobTab {
     $safeJobName = ConvertTo-JsSafeName -Name $JobName
     for ($retry = 0; $retry -lt 15; $retry++) {
         # 查找岗位卡：优先精确匹配，退而 includes 模糊；命中即打 data 标记
-        $findJs = '(()=>{const items=document.querySelectorAll(''.job-pane__item'');let exact=null,fuzzy=null;for(const l of items){const t=l.textContent.trim();if(t==="' + $safeJobName + '"){exact=l;break}if(!fuzzy&&t.includes("' + $safeJobName + '")){fuzzy=l}}const el=exact||fuzzy;if(!el)return"no";el.setAttribute("data-wb-job","1");return(exact?"exact:":"fuzzy:")+el.textContent.trim().substring(0,40)})()'
+        $findJs = '(()=>{const items=document.querySelectorAll(''.job-pane__item'');const q="' + $safeJobName + '".toLowerCase();let exact=null,fuzzy=null;for(const l of items){const t=l.textContent.trim();const tl=t.toLowerCase();if(tl===q){exact=l;break}if(!fuzzy&&tl.includes(q)){fuzzy=l}}const el=exact||fuzzy;if(!el)return"no";el.setAttribute("data-wb-job","1");return(exact?"exact:":"fuzzy:")+el.textContent.trim().substring(0,40)})()'
         $fr = Invoke-Eval $findJs
         if ($fr -match '"value":"(exact|fuzzy):(.*?)"') {
             $kind = $Matches[1]
@@ -178,6 +180,59 @@ function Get-VisibleCardCount {
     $cr = Invoke-Eval 'String(document.querySelectorAll(".talent-basic-info__name").length)'
     if ($cr -match '"value":"(\d+)"') { return [int]$Matches[1] }
     return -1
+}
+
+# ------------------------------------------------------------
+# #64 网页崩溃自愈（2026-09-16 用户指令：刷简历时网页崩溃 → 自动重新加载）
+# ------------------------------------------------------------
+
+# 页面存活真探测：evaluate 最小表达式。崩溃 tab / session 无 tab / daemon 死 → 均返回 $false
+function Test-PageAlive {
+    $r = Invoke-Eval '1'
+    return ($r -match '"ok":true')
+}
+
+# 崩溃恢复：newTab 重建标签页（死 tab 上 navigate newTab=$false 无法恢复，必须 newTab=$true 新开）
+# → 等列表渲染（30s 宽限，崩溃后重载更慢）→ 岗位复核（#61 精神：恢复后必须证明激活岗位正确，
+#   探测不到或不匹配 → 重新走 Select-JobTab 三级点击选岗）→ 回顶。
+# $processed 登记表由主循环持有不受影响，恢复后从头扫描、已下载卡片自动跳过。返回 $true=恢复成功。
+function Repair-PageCrash {
+    param([string]$Reason)
+    Write-Log "RECOVER: page crash detected ($Reason) - rebuilding tab..." -Level FAIL
+    Ensure-TabFocused
+    $null = Send-Web -Action 'navigate' -Payload @{ url = $Config.Url; newTab = $true; group_title = 'Zhaopin Resume Screening' }
+    Wait 1000
+    Ensure-TabFocused
+    $listOk = Wait-Until -TimeoutMs 30000 -PollMs 1000 -Description 'crash reload - list render' -Condition { (Get-VisibleCardCount) -gt 0 }
+    if (-not $listOk) {
+        Write-Log 'RECOVER: list still not rendered after reload' -Level WARN
+        return $false
+    }
+    # 岗位复核：URL 带正确 jobNumber 时重载后通常自动激活正确岗位；不匹配则重新选岗
+    $activeJob = Get-ActiveJobName
+    $expectedClean = $Config.JobName.Trim()
+    $expectedNoParen = $expectedClean -replace '\s*\(.*$', ''
+    $jobOk = $false
+    if ($activeJob) {
+        $activeClean   = $activeJob.Trim()
+        $activeNoParen = $activeClean -replace '\s*\(.*$', ''
+        if ($activeClean -eq $expectedClean -or $activeNoParen -eq $expectedNoParen -or $activeClean -like "*$expectedClean*") { $jobOk = $true }
+    }
+    if (-not $jobOk) {
+        Write-Log "RECOVER: active job undetected/mismatched after reload (active=[$activeJob]) - re-selecting job..." -Level WARN
+        if (-not (Select-JobTab -JobName $Config.JobName)) {
+            Write-Log 'RECOVER: job re-selection failed after crash reload' -Level FAIL
+            return $false
+        }
+        Wait 1000
+        $null = Wait-Until -TimeoutMs 15000 -PollMs 1000 -Description 'post-reselect list render' -Condition { (Get-VisibleCardCount) -gt 0 }
+    } else {
+        Write-Log "RECOVER: active job verified [$activeJob] after reload" -Level OK
+    }
+    $null = Invoke-Eval '(()=>{const c=document.querySelector(".app-layout--default")||document.scrollingElement;if(c)c.scrollTop=0;window.scrollTo(0,0);return "ok"})()'
+    Wait 1000
+    Write-Log 'RECOVER: page crash recovery complete - resuming download loop' -Level OK
+    return $true
 }
 
 # ------------------------------------------------------------

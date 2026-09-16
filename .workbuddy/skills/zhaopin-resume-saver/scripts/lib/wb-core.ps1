@@ -169,19 +169,31 @@ function Initialize-WebBridgeEnv {
         }
         Write-Log 'starting WebBridge daemon...' -Level STEP
         $null = & $DaemonExe 'start' 2>&1
-        Wait 4000
-        if (-not (Test-PortListening -Port 10086)) {
+        # #63：固定 4s → 500ms 粒度端口轮询（上限 8s），daemon 秒起时立即继续
+        $portUp = $false
+        for ($pi = 0; $pi -lt 16; $pi++) {
+            Wait 500
+            if (Test-PortListening -Port 10086) { $portUp = $true; break }
+        }
+        if (-not $portUp) {
             Write-Log 'daemon failed to listen on 10086 after start' -Level FAIL
             return $false
         }
     }
 
-    # 3) 扩展连接：list_tabs 真探测，耐心轮询等重连（反复 stop/start 后扩展掉线实测 round 6 才重连）
+    # 3) 扩展连接：list_tabs 真探测，自适应间隔轮询（#63：1s→3s→5s，快就绪 <1s 命中；
+    #    总上限 230s 不低于旧固定 40×5s=200s——反复 stop/start 后扩展掉线实测 round 6 才重连）
     Write-Log 'probing extension via list_tabs (true probe)...' -Level STEP
     $ready = $false
-    for ($i = 1; $i -le 40; $i++) {
-        if (Test-ExtensionReady) { $ready = $true; break }
-        Wait 5000
+    $sched = @( @(10,1000), @(15,3000), @(35,5000) )
+    $i = 0
+    foreach ($s in $sched) {
+        for ($j = 0; $j -lt $s[0]; $j++) {
+            $i++
+            if (Test-ExtensionReady) { $ready = $true; break }
+            Wait $s[1]
+        }
+        if ($ready) { break }
     }
     if (-not $ready) {
         Write-Log 'extension not connected after 200s — open Chrome and check kimi-webbridge extension' -Level FAIL
